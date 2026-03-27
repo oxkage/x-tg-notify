@@ -364,6 +364,7 @@ async def main():
                 log.info(f"Seeded @{uname}: {tweets[0]['id']}")
     save_seen({"seen_tweet_ids": seen_tweet_ids})
 
+    seen_notif_ids = set()  # track bell notification IDs to avoid re-processing
     last_update_id = 0
     last_poll = 0
 
@@ -390,6 +391,13 @@ async def main():
                     icon, msg = n["icon"], n["message"]
                     if "login" in msg.lower() or "temporary label" in msg.lower(): continue
                     if icon != "bell_icon": continue
+
+                    # Dedup: skip if already processed this bell notification
+                    nid = n.get("id", "")
+                    if nid in seen_notif_ids: continue
+                    seen_notif_ids.add(nid)
+                    if len(seen_notif_ids) > 200:
+                        seen_notif_ids = set(list(seen_notif_ids)[-100:])
 
                     matched = None
                     for uname, info in watchlist.items():
