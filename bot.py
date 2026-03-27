@@ -106,9 +106,12 @@ def get_x_session():
 
 _ct = None
 
+_ct_time = 0
+
 def get_ct():
-    global _ct
-    if _ct is None:
+    global _ct, _ct_time
+    # Refresh CT every 45 minutes (TTL is ~60 min)
+    if _ct is None or (time.time() - _ct_time) > 2700:
         session = get_x_session()
         ct_headers = generate_headers()
         home = session.get("https://x.com", headers=ct_headers, timeout=10)
@@ -116,6 +119,8 @@ def get_ct():
         ondemand_url = get_ondemand_file_url(response=home_resp)
         ondemand = session.get(ondemand_url, headers=ct_headers, timeout=10)
         _ct = ClientTransaction(home_page_response=home_resp, ondemand_file_response=ondemand.text)
+        _ct_time = time.time()
+        log.info("ClientTransaction refreshed")
     return _ct
 
 def xh(url="", method="GET"):
