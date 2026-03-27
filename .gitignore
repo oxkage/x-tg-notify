@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+watchlist.json
+seen_state.json
+venv/
+*.log
