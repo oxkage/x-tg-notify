@@ -13,6 +13,30 @@ BASE_DIR = Path(__file__).parent
 ENV_FILE = BASE_DIR / ".env"
 WATCHLIST_FILE = BASE_DIR / "watchlist.json"
 SEEN_FILE = BASE_DIR / "seen_state.json"
+SETTINGS_FILE = BASE_DIR / "settings.json"
+PID_FILE = BASE_DIR / ".bot.pid"
+
+# ── Single Instance Lock ────────────────────────────────────────────
+def acquire_lock():
+    """Prevent multiple bot instances from running simultaneously."""
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            # Check if process is still alive
+            os.kill(old_pid, 0)
+            print(f"❌ Bot already running (PID {old_pid}). Kill it first or delete .bot.pid")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            pass  # Stale PID file — safe to continue
+    PID_FILE.write_text(str(os.getpid()))
+
+def release_lock():
+    """Clean up PID file on exit."""
+    try:
+        if PID_FILE.exists() and PID_FILE.read_text().strip() == str(os.getpid()):
+            PID_FILE.unlink()
+    except Exception:
+        pass
 
 BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 NOTIF_QUERY_ID = "ZhJlpN0aKcSkccG5Pz1MEw"
@@ -47,6 +71,7 @@ TWEET_FEATURES = {
 }
 
 POLL_INTERVAL = 5
+TIMELINE_INTERVAL = 60
 REQUIRED_ENV = ["X_AUTH_TOKEN", "X_CT0", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
 
 # ── Runtime Stats ──────────────────────────────────────────────────
@@ -344,6 +369,26 @@ def load_seen():
 def save_seen(state):
     _atomic_write(SEEN_FILE, json.dumps(state))
 
+DEFAULT_SETTINGS = {
+    "photo_enabled": True,
+    "video_enabled": False,
+    "gif_enabled": True,
+}
+
+def load_settings():
+    if SETTINGS_FILE.exists():
+        try:
+            saved = json.loads(SETTINGS_FILE.read_text())
+            settings = DEFAULT_SETTINGS.copy()
+            settings.update(saved)
+            return settings
+        except Exception:
+            pass
+    return DEFAULT_SETTINGS.copy()
+
+def save_settings(settings):
+    _atomic_write(SETTINGS_FILE, json.dumps(settings, indent=2))
+
 # ── Rate Limiter ────────────────────────────────────────────────────
 class RateLimiter:
     def __init__(self):
@@ -496,17 +541,18 @@ def fetch_notifications(count=40) -> list[dict]:
     f = json.dumps(NOTIF_FEATURES, separators=(",", ":"))
     url = f"https://x.com/i/api/graphql/{NOTIF_QUERY_ID}/NotificationsTimeline?variables={urllib.parse.quote(v)}&features={urllib.parse.quote(f)}"
     r = get_x_session().get(url, headers=xh(url), timeout=15)
-    if r.status_code == 200:
-        _rate.mark_ok("notif")
-        return []
-    elif r.status_code == 429:
+    if r.status_code == 429:
         _rate.mark_fail("notif")
         return []
     elif r.status_code in (401, 403):
         log.error(f"X API auth failed ({r.status_code}) — token may be expired")
+        if not AUTH_EXPIRED_SENT:
+            asyncio.get_event_loop().create_task(tg_send_token_refresh_guidance())
         return []
-    else:
+    elif r.status_code != 200:
+        log.warning(f"Notifications fetch failed: {r.status_code}")
         return []
+    _rate.mark_ok("notif")
     try:
         timeline = r.json()["data"]["viewer_v2"]["user_results"]["result"]["notification_timeline"]["timeline"]
     except (KeyError, TypeError):
@@ -578,11 +624,14 @@ def fetch_user_tweets(user_id: str, count=5) -> list[dict]:
                     best_v = max((v for v in variants if v.get("content_type") == "video/mp4"),
                                  key=lambda v: v.get("bitrate", 0), default=None)
                     if best_v:
-                        video_url = best_v.get("url")
+                        raw_url = best_v.get("url", "")
+                        # Strip query params — Telegram can't handle them
+                        video_url = raw_url if raw_url else None
                 elif not gif_url and mtype == "animated_gif":
                     variants = m.get("video_info", {}).get("variants", [])
                     if variants:
-                        gif_url = variants[0].get("url")
+                        raw_url = variants[0].get("url", "")
+                        gif_url = raw_url if raw_url else None
 
             user_result = tweet_result.get("core", {}).get("user_results", {}).get("result", {})
             u_legacy = user_result.get("legacy", {}) if user_result else {}
@@ -622,11 +671,13 @@ def fetch_user_tweets(user_id: str, count=5) -> list[dict]:
                             best_v = max((v for v in variants if v.get("content_type") == "video/mp4"),
                                          key=lambda v: v.get("bitrate", 0), default=None)
                             if best_v:
-                                video_url = best_v.get("url")
+                                raw_url = best_v.get("url", "")
+                                video_url = raw_url if raw_url else None
                         elif not gif_url and mtype == "animated_gif":
                             variants = m.get("video_info", {}).get("variants", [])
                             if variants:
-                                gif_url = variants[0].get("url")
+                                raw_url = variants[0].get("url", "")
+                                gif_url = raw_url if raw_url else None
             else:
                 text = legacy.get("full_text", "")
                 user_screen = u_legacy.get("screen_name", "")
@@ -662,12 +713,54 @@ async def get_tg() -> httpx.AsyncClient:
 
 async def tg_send(text, chat_id=TG_CHAT, photo=None, video=None, animation=None,
                   button_url=None, button_text="🔗 Go to Post", buttons=None):
+    """Send rich formatted message with fallback."""
+    await tg_send_rich(text, chat_id=chat_id, photo=photo, video=video,
+                       animation=animation, button_url=button_url,
+                       button_text=button_text, buttons=buttons)
+
+async def tg_send_rich(text, chat_id=TG_CHAT, photo=None, video=None, animation=None,
+                       button_url=None, button_text="🔗 Go to Post", buttons=None):
+    """Send rich formatted message with embedded media using sendRichMessage API."""
     c = await get_tg()
     reply_markup = None
     if buttons:
         reply_markup = json.dumps({"inline_keyboard": [buttons]})
     elif button_url:
         reply_markup = json.dumps({"inline_keyboard": [[{"text": button_text, "url": button_url}]]})
+
+    # Build rich markdown with embedded media
+    md = text
+    if photo:
+        md += f"\n\n![]({photo})"
+    elif video:
+        md += f"\n\n![]({video})"
+    elif animation:
+        md += f"\n\n![]({animation})"
+
+    payload = {
+        "chat_id": chat_id,
+        "rich_message": json.dumps({"markdown": md}),
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    try:
+        r = await c.post(f"{TG_API}/sendRichMessage", data=payload)
+        if r.status_code == 200:
+            return
+        # Fallback to legacy if rich message fails
+        log.warning(f"sendRichMessage failed ({r.status_code}), falling back to legacy")
+        await _tg_send_legacy(text, chat_id=chat_id, photo=photo, video=video,
+                              animation=animation, reply_markup=reply_markup)
+    except Exception as e:
+        log.warning(f"tg_send_rich failed: {e}")
+        await _tg_send_legacy(text, chat_id=chat_id, photo=photo, video=video,
+                              animation=animation, reply_markup=reply_markup)
+
+async def _tg_send_legacy(text, chat_id=TG_CHAT, photo=None, video=None, animation=None,
+                          reply_markup=None):
+    """Legacy sendMessage/sendPhoto/sendVideo fallback."""
+    c = await get_tg()
     try:
         if photo:
             data = {"chat_id": chat_id, "caption": text, "parse_mode": "HTML", "photo": photo}
@@ -686,7 +779,7 @@ async def tg_send(text, chat_id=TG_CHAT, photo=None, video=None, animation=None,
             if reply_markup: payload["reply_markup"] = reply_markup
             await c.post(f"{TG_API}/sendMessage", json=payload)
     except Exception as e:
-        log.warning(f"tg_send failed: {e}")
+        log.warning(f"tg_send_legacy failed: {e}")
 
 async def tg_answer_callback(callback_id, text="", show_alert=False):
     c = await get_tg()
@@ -704,17 +797,17 @@ async def tg_send_token_refresh_guidance():
         return
     AUTH_EXPIRED_SENT = True
     msg = (
-        "⚠️ <b>X Auth Token Expired</b>\n\n"
+        "## ⚠️ X Auth Token Expired\n\n"
         "Your session cookies have expired. The bot cannot fetch notifications.\n\n"
-        "<b>How to fix:</b>\n"
+        "**How to fix:**\n"
         "1. Open https://x.com in your browser\n"
         "2. Log in to your account\n"
         "3. Press F12 → Application → Cookies → x.com\n"
         '4. Copy new "auth_token" (40-char hex)\n'
         '5. Copy new "ct0" (long hex)\n\n'
-        "Then run: <code>python3 bot.py --setup</code>\n"
+        "Then run: `python3 bot.py --setup`\n"
         "Or edit .env directly with the new values.\n\n"
-        "<i>This message won't repeat until restart.</i>"
+        "_This message won't repeat until restart._"
     )
     await tg_send(msg)
 
@@ -744,7 +837,7 @@ async def tg_get_updates(offset=0):
     return []
 
 # ── Commands ────────────────────────────────────────────────────────
-async def handle_cmd(text, chat_id, watchlist):
+async def handle_cmd(text, chat_id, watchlist, settings):
     parts = text.strip().split()
     cmd = parts[0].lower()
 
@@ -819,16 +912,42 @@ async def handle_cmd(text, chat_id, watchlist):
         )
         await tg_send(status, chat_id)
 
-    elif cmd in ("/start", "/help"):
+    elif cmd == "/settings":
+        photo_on = settings.get("photo_enabled", True)
+        video_on = settings.get("video_enabled", True)
+        gif_on = settings.get("gif_enabled", True)
+        buttons = [
+            [{"text": f"📷 Photo: {'ON 🟢' if photo_on else 'OFF 🔴'}", "callback_data": "toggle_photo"}],
+            [{"text": f"🎬 Video: {'ON 🟢' if video_on else 'OFF 🔴'}", "callback_data": "toggle_video"}],
+            [{"text": f"🎞 GIF: {'ON 🟢' if gif_on else 'OFF 🔴'}", "callback_data": "toggle_gif"}],
+        ]
+        keyboard = json.dumps({"inline_keyboard": buttons})
+        c = await get_tg()
+        await c.post(f"{TG_API}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": f"⚙️ <b>Settings</b>\n\n"
+                    f"Posts always sent. Toggle media types:",
+            "parse_mode": "HTML",
+            "reply_markup": keyboard
+        })
+
+    elif cmd in ("/start", "/help", "/"):
         await tg_send(
-            "🤖 <b>X Notify Bot</b>\n\n"
-            "/add @username — Follow + notify ON\n"
-            "/remove @username — Unfollow + notify OFF\n"
-            "/list — Show watched users\n"
-            "/status — Bot status + stats\n\n"
-            "🔔 New posts forwarded with inline buttons:\n"
-            "• 🔗 Go to Post\n"
-            "• 🔕 Stop Notify — remove from watchlist",
+            "## 🤖 X Notify Bot\n\n"
+            "**Commands:**\n\n"
+            "| Command | Description |\n"
+            "|---------|-------------|\n"
+            "| `/add @username` | Follow + notify ON |\n"
+            "| `/remove @username` | Unfollow + notify OFF |\n"
+            "| `/list` | Show watched users |\n"
+            "| `/status` | Bot status + stats |\n"
+            "| `/settings` | Toggle media types |\n"
+            "| `/help` | Show this message |\n\n"
+            "---\n\n"
+            "**Inline buttons:**\n"
+            "• 🔗 Go to Post — opens tweet\n"
+            "• 🔕 Stop Notify — remove from watchlist\n\n"
+            "Posts are always forwarded. Media toggles only control attachments.",
             chat_id
         )
 
@@ -841,6 +960,8 @@ async def main():
     log.info("X session ready")
     watchlist = load_watchlist()
     log.info(f"Watchlist: {list(watchlist.keys())}")
+    settings = load_settings()
+    log.info(f"Settings: {settings}")
     await tg_send("🤖 X Notify Bot started!\nUse /help for commands.")
 
     state = load_seen()
@@ -870,6 +991,7 @@ async def main():
     last_tweet_fetch: dict[str, float] = {}
     last_update_id = 0
     last_poll = 0
+    last_timeline_poll = 0
 
     while True:
         now = time.time()
@@ -899,12 +1021,43 @@ async def main():
                         else:
                             await tg_answer_callback(cb_id, f"@{uname} not in watchlist", show_alert=True)
                         continue
+                    elif cb_data.startswith("toggle_"):
+                        media_type = cb_data.split("_", 1)[1]
+                        key = f"{media_type}_enabled"
+                        if key in settings:
+                            settings[key] = not settings[key]
+                        else:
+                            settings[key] = True
+                        save_settings(settings)
+                        emoji = "📷" if media_type == "photo" else "🎬" if media_type == "video" else "🎞"
+                        state = "ON 🟢" if settings[key] else "OFF 🔴"
+                        await tg_answer_callback(cb_id, f"{emoji} {media_type.title()}: {state}")
+                        # Rebuild buttons
+                        photo_on = settings.get("photo_enabled", True)
+                        video_on = settings.get("video_enabled", True)
+                        gif_on = settings.get("gif_enabled", True)
+                        buttons = [
+                            [{"text": f"📷 Photo: {'ON 🟢' if photo_on else 'OFF 🔴'}", "callback_data": "toggle_photo"}],
+                            [{"text": f"🎬 Video: {'ON 🟢' if video_on else 'OFF 🔴'}", "callback_data": "toggle_video"}],
+                            [{"text": f"🎞 GIF: {'ON 🟢' if gif_on else 'OFF 🔴'}", "callback_data": "toggle_gif"}],
+                        ]
+                        keyboard = json.dumps({"inline_keyboard": buttons})
+                        c = await get_tg()
+                        await c.post(f"{TG_API}/editMessageText", json={
+                            "chat_id": cb_chat,
+                            "message_id": cb.get("message", {}).get("message_id"),
+                            "text": f"⚙️ <b>Settings</b>\n\n"
+                                    f"Posts always sent. Toggle media types:",
+                            "parse_mode": "HTML",
+                            "reply_markup": keyboard
+                        })
+                        continue
 
                 msg = u.get("message", {})
                 text = msg.get("text", "")
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if text.startswith("/"):
-                    await handle_cmd(text, chat_id, watchlist)
+                    await handle_cmd(text, chat_id, watchlist, settings)
                     id_to_uname = {}
                     for un, info in watchlist.items():
                         uid = info.get("id", "")
@@ -975,17 +1128,20 @@ async def main():
                         profile_url = f"https://x.com/{matched}"
                         post_time = format_tweet_time(best.get("created", ""))
 
-                        rt_prefix = f"🔁 RT by <a href=\"{profile_url}\">{name}</a>\n" if best.get("is_retweet") else ""
                         quote_block = ""
                         if best.get("is_quote") and best.get("quote_text"):
                             q_user = best.get("quote_user", "")
                             q_text = best.get("quote_text", "")[:200]
-                            quote_block = f"\n\n↪️ Quoted <a href=\"https://x.com/{q_user}\">@{q_user}</a>:\n<i>{q_text}</i>"
+                            quote_block = f"\n\n> ↪️ **@{q_user}**: {q_text}"
+                        tweet_text = best["text"][:400]
+                        # Wrap long tweets in collapsible block
+                        if len(best.get("text", "")) > 200:
+                            tweet_text = f"> {best['text'][:150]}...\n>\n> (click Go to Post for full text)"
                         caption = (
-                            f"🔔 <b>New Post</b>\n"
-                            f"👤 <a href=\"{profile_url}\">{name}</a> (@{matched})\n\n"
-                            f"{rt_prefix}{best['text'][:400]}{quote_block}\n\n"
-                            f"🕐 {post_time}"
+                            f"## 🔔 New Post\n\n"
+                            f"**{name}** ([@{matched}]({profile_url}))\n\n"
+                            f"{tweet_text}{quote_block}\n\n"
+                            f"---\n🕐 {post_time}"
                         )
 
                         buttons = [
@@ -993,23 +1149,103 @@ async def main():
                             {"text": "🔕 Stop Notify", "callback_data": f"stop:{matched}"},
                         ]
                         # Send with appropriate media type
-                        media_sent = False
-                        if best.get("video_url"):
-                            await tg_send(caption, video=best["video_url"], buttons=buttons)
-                            media_sent = True
-                        elif best.get("gif_url"):
-                            await tg_send(caption, animation=best["gif_url"], buttons=buttons)
-                            media_sent = True
-                        elif best.get("photo_url"):
-                            await tg_send(caption, photo=best["photo_url"], buttons=buttons)
-                            media_sent = True
-                        if not media_sent:
+                        photo_enabled = settings.get("photo_enabled", True)
+                        video_enabled = settings.get("video_enabled", False)
+                        gif_enabled = settings.get("gif_enabled", True)
+                        media_url = None
+                        media_type = None
+                        if video_enabled and best.get("video_url"):
+                            media_url = best["video_url"]
+                            media_type = "video"
+                        elif gif_enabled and best.get("gif_url"):
+                            media_url = best["gif_url"]
+                            media_type = "gif"
+                        elif photo_enabled and best.get("photo_url"):
+                            media_url = best["photo_url"]
+                            media_type = "photo"
+                        # Always send text, attach media if enabled
+                        if media_type == "video":
+                            await tg_send(caption, video=media_url, buttons=buttons)
+                        elif media_type == "gif":
+                            await tg_send(caption, animation=media_url, buttons=buttons)
+                        elif media_type == "photo":
+                            await tg_send(caption, photo=media_url, buttons=buttons)
+                        else:
                             await tg_send(caption, buttons=buttons)
                         _rate.mark_ok(f"tweets:{matched}")
                         log.info(f"Forwarded @{matched} {best['id']}")
 
             except Exception as e:
                 log.warning(f"Poll error: {e}")
+
+        # Timeline fallback — catches tweets missed by notification gap
+        if now - last_timeline_poll >= TIMELINE_INTERVAL:
+            last_timeline_poll = now
+            for uname, info in list(watchlist.items()):
+                uid = info.get("id", "")
+                if not uid: continue
+                tw_wait = _rate.wait_time(f"tweets:{uname}", 10)
+                if tw_wait > 0: await asyncio.sleep(tw_wait)
+                try:
+                    tweets = fetch_user_tweets(uid, 10)
+                    if not tweets: continue
+                    last_seen = seen_tweet_ids.get(uname, "0")
+                    new_tweets = []
+                    for t in tweets:
+                        if t.get("is_retweet"): continue
+                        if t["id"] > last_seen:
+                            new_tweets.append(t)
+                    for best in new_tweets:
+                        # Skip if notification loop already forwarded this tweet
+                        if best["id"] <= seen_tweet_ids.get(uname, "0"):
+                            continue
+                        # Update seen IMMEDIATELY to prevent notification loop from re-forwarding
+                        seen_tweet_ids[uname] = best["id"]
+                        tid = best["id"]
+                        tweet_url = f"https://x.com/{uname}/status/{tid}"
+                        profile_url = f"https://x.com/{uname}"
+                        post_time = format_tweet_time(best.get("created", ""))
+                        tweet_text = best["text"][:400]
+                        if len(best.get("text", "")) > 200:
+                            tweet_text = f"> {best['text'][:150]}...\n>\n> (click Go to Post for full text)"
+                        caption = (
+                            f"## 🔔 New Post\n\n"
+                            f"**{info['name']}** ([@{uname}]({profile_url}))\n\n"
+                            f"{tweet_text}\n\n"
+                            f"---\n🕐 {post_time}"
+                        )
+                        buttons = [
+                            {"text": "🔗 Go to Post", "url": tweet_url},
+                            {"text": "🔕 Stop Notify", "callback_data": f"stop:{uname}"},
+                        ]
+                        photo_enabled = settings.get("photo_enabled", True)
+                        video_enabled = settings.get("video_enabled", False)
+                        gif_enabled = settings.get("gif_enabled", True)
+                        media_url = None
+                        media_type = None
+                        if video_enabled and best.get("video_url"):
+                            media_url = best["video_url"]
+                            media_type = "video"
+                        elif gif_enabled and best.get("gif_url"):
+                            media_url = best["gif_url"]
+                            media_type = "gif"
+                        elif photo_enabled and best.get("photo_url"):
+                            media_url = best["photo_url"]
+                            media_type = "photo"
+                        if media_type == "video":
+                            await tg_send(caption, video=media_url, buttons=buttons)
+                        elif media_type == "gif":
+                            await tg_send(caption, animation=media_url, buttons=buttons)
+                        elif media_type == "photo":
+                            await tg_send(caption, photo=media_url, buttons=buttons)
+                        else:
+                            await tg_send(caption, buttons=buttons)
+                        FORWARDED_COUNT += 1
+                        log.info(f"Timeline poll forwarded @{uname} {tid}")
+                    # seen_tweet_ids already updated per-tweet above
+                except Exception as e:
+                    log.warning(f"Timeline poll error @{uname}: {e}")
+            save_seen({"seen_tweet_ids": seen_tweet_ids})
 
         await asyncio.sleep(0.5)
 
@@ -1036,11 +1272,16 @@ def entry():
     validate_env()
     check_deps()
 
+    # Single instance lock
+    acquire_lock()
+
     # Run
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         log.info("Shutting down.")
+    finally:
+        release_lock()
 
 if __name__ == "__main__":
     entry()

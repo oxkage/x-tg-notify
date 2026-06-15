@@ -7,9 +7,9 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-3776ab?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-44cc11?style=flat-square)](LICENSE)
 
-Monitor X accounts and receive instant Telegram alerts when they post — with photos, clickable links, and inline action buttons.
+Monitor X accounts and receive instant Telegram alerts when they post — with photos, videos, clickable links, and inline action buttons.
 
-[Features](#features) · [Quick Start](#quick-start) · [Commands](#commands) · [Configuration](#configuration)
+[Features](#features) · [Quick Start](#quick-start) · [Commands](#commands) · [Configuration](#configuration) · [Debug CLI](#debug-cli)
 
 </div>
 
@@ -18,13 +18,16 @@ Monitor X accounts and receive instant Telegram alerts when they post — with p
 ## Features
 
 - **Real-time forwarding** — polls X notifications every 5 seconds, forwards new posts instantly
-- **Photo support** — tweets with images arrive as native Telegram photos
+- **Rich messages** — structured formatting with headings, dividers, and embedded media
+- **Photo + Video + GIF** — media types individually toggleable via `/settings`
 - **Inline buttons** — "Go to Post" links directly to the tweet, "Stop Notify" removes the account
 - **Auto-follow** — `/add` automatically follows the user and enables post notifications
 - **Deduplication** — tweet ID tracking persists across restarts, never forwards the same tweet twice
 - **Anti-detection** — Chrome TLS fingerprint impersonation + per-request transaction headers
 - **Setup wizard** — interactive first-run guides you through credentials, creates venv, validates connections
 - **Rate limit aware** — exponential backoff on 429s, stays within X API limits
+- **Single instance lock** — PID file prevents multiple bot instances running simultaneously
+- **Timeline fallback** — catches tweets missed by notification polling (every 60 seconds)
 
 ---
 
@@ -67,6 +70,8 @@ New posts arrive in your Telegram chat with photos, timestamps, and inline butto
 | `/add @username` | Follow user + enable post notifications |
 | `/remove @username` | Disable notifications + unfollow |
 | `/list` | Show all watched users |
+| `/status` | Bot status + stats |
+| `/settings` | Toggle media types (photo/video/gif) |
 | `/help` | Show help message |
 
 **Example — adding an account:**
@@ -84,11 +89,15 @@ Bot:    ✅ Added Elon Musk
 **Example — forwarded post:**
 
 ```
-Bot:    🔔 New Post
-        👤 Elon Musk (@elonmusk)
+Bot:    ## 🔔 New Post
+
+        **Elon Musk** ([@elonmusk](https://x.com/elonmusk))
 
         The thing about gravity is...
 
+        📸 [embedded photo]
+
+        ---
         🕐 Mar 27, 2026 · 14:30 UTC
 
         [🔗 Go to Post]  [🔕 Stop Notify]
@@ -132,6 +141,18 @@ The setup wizard handles this interactively. For reference:
 
 ## Configuration
 
+### Media Settings
+
+Toggle individual media types via `/settings` in Telegram:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `photo_enabled` | ON | Send tweet photos |
+| `video_enabled` | OFF | Send tweet videos |
+| `gif_enabled` | ON | Send tweet GIFs |
+
+Posts are always forwarded — toggles only control media attachment.
+
 ### Polling interval
 
 Default: **5 seconds**. Change in `bot.py`:
@@ -154,6 +175,47 @@ X's `NotificationsTimeline` endpoint allows ~1500 requests per 16 minutes.
 
 ---
 
+## Debug CLI
+
+Test individual components without running the full bot:
+
+```bash
+source venv/bin/activate
+
+# Fetch a tweet by ID
+python3 debug.py tweet <tweet_id>
+
+# Send a tweet to Telegram (full pipeline)
+python3 debug.py send <tweet_id>
+
+# Send text only (no media)
+python3 debug.py send-text <tweet_id>
+
+# Test Telegram connection
+python3 debug.py test-tg
+
+# Test video/photo sending
+python3 debug.py test-video <url>
+python3 debug.py test-photo <url>
+
+# Show current notifications
+python3 debug.py notifs
+
+# Fetch user timeline
+python3 debug.py timeline <username>
+
+# Show state (seen tweets, watchlist, settings)
+python3 debug.py state
+
+# Clear seen state
+python3 debug.py reset
+
+# Show raw API response
+python3 debug.py raw <tweet_id>
+```
+
+---
+
 ## Architecture
 
 ```
@@ -168,8 +230,8 @@ X (Twitter) API                    x-tg-notify Bot
                                    │        │        │
 Telegram Bot API                   │        ▼        │
 ┌─────────────────┐                │  ┌───────────┐  │
-│ sendMessage     │◄── forward ───│  │ Dedup     │  │
-│ sendPhoto       │                │  │ (tweet ID)│  │
+│ sendRichMessage │◄── forward ───│  │ Dedup     │  │
+│ sendMessage     │                │  │ (tweet ID)│  │
 │ callbackQuery   │── /add, etc ──►│  └───────────┘  │
 └─────────────────┘                └─────────────────┘
 ```
@@ -177,7 +239,8 @@ Telegram Bot API                   │        ▼        │
 1. Bot polls `NotificationsTimeline` GraphQL endpoint every 5 seconds
 2. On `bell_icon` notification (new post), fetches latest tweets via `UserTweets`
 3. Compares tweet ID against stored last-seen ID (snowflake: greater = newer)
-4. Forwards to Telegram with photo, timestamp, and inline buttons
+4. Forwards to Telegram with rich formatting, embedded media, and inline buttons
+5. Timeline fallback (every 60s) catches tweets missed by notification polling
 
 ---
 
@@ -186,22 +249,27 @@ Telegram Bot API                   │        ▼        │
 ```
 x-tg-notify/
 ├── bot.py              # Setup wizard + bot runtime
+├── debug.py            # Debug CLI for testing
 ├── requirements.txt    # Python dependencies
 ├── .env.example        # Credential template
 ├── .env                # Your credentials (git-ignored)
+├── settings.json       # Media toggle settings (git-ignored)
 ├── venv/               # Virtual environment (auto-created)
 ├── watchlist.json      # Watched users (auto-created)
-└── seen_state.json     # Dedup state (auto-created)
+├── seen_state.json     # Dedup state (auto-created)
+└── .bot.pid            # Single instance lock (auto-created)
 ```
 
 ---
 
 ## Troubleshooting
 
-**409 Conflict** — Another bot instance is running. Kill it:
+**409 Conflict** — Another bot instance is running. The PID lock should prevent this, but if it happens:
 
 ```bash
 pkill -f "python3 bot.py"
+rm .bot.pid
+python3 bot.py
 ```
 
 **Unauthorized on notifications** — Your `auth_token` expired. Re-copy fresh cookies from your browser.
