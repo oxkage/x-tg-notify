@@ -218,23 +218,7 @@ python3 debug.py raw <tweet_id>
 
 ## Architecture
 
-```
-X (Twitter) API                    x-tg-notify Bot
-┌─────────────────┐                ┌─────────────────┐
-│ Notifications   │◄── poll 5s ───│ Poll loop       │
-│ Timeline (GQL)  │── bell_icon ──►│                 │
-├─────────────────┤                │  ┌───────────┐  │
-│ UserTweets (GQL)│◄── fetch ─────│  │ Watchlist  │  │
-│                 │── tweet data ──►│  │ (JSON)    │  │
-└─────────────────┘                │  └───────────┘  │
-                                   │        │        │
-Telegram Bot API                   │        ▼        │
-┌─────────────────┐                │  ┌───────────┐  │
-│ sendRichMessage │◄── forward ───│  │ Dedup     │  │
-│ sendMessage     │                │  │ (tweet ID)│  │
-│ callbackQuery   │── /add, etc ──►│  └───────────┘  │
-└─────────────────┘                └─────────────────┘
-```
+![Architecture Diagram](architecture.png)
 
 1. Bot polls `NotificationsTimeline` GraphQL endpoint every 5 seconds
 2. On `bell_icon` notification (new post), fetches latest tweets via `UserTweets`
