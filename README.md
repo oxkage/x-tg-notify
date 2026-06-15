@@ -55,49 +55,49 @@ All dependencies are installable via pip. **No external scripts or local files r
 |---------|---------|
 | [`curl_cffi`](https://github.com/yifeikong/curl_cffi) | Chrome TLS fingerprint impersonation |
 | [`x_client_transaction`](https://github.com/iSarabjitDhiman/XClientTransaction) | X anti-detection (`x-client-transaction-id` header) |
-| [`twitter-cli`](https://github.com/yifeikong/twitter-cli) | X API CLI tool (tweet fetching, auth) |
+
 | [`httpx`](https://github.com/encode/httpx) | Async HTTP client for Telegram API |
 | [`beautifulsoup4`](https://www.crummy.com/software/BeautifulSoup/) | HTML parsing for X page initialization |
 
 ---
 
-## 🚀 Installation
+## 🚀 Quick Start
 
-### 1. Clone the repo
-
+### 1. Clone
 ```bash
 git clone https://github.com/oxkage/x-tg-notify.git
 cd x-tg-notify
 ```
 
-### 2. Install dependencies
-
+### 2. Run
 ```bash
-pip install curl_cffi x_client_transaction twitter-cli httpx beautifulsoup4
+python3 bot.py
 ```
 
-### 3. Configure credentials
+On first run, the **setup wizard** launches automatically — it will:
+- ✅ Check Python 3.10+
+- ✅ Create virtual environment
+- ✅ Install all dependencies
+- ✅ Guide you through getting each credential (step-by-step)
+- ✅ Validate Telegram connection (sends test message)
+- ✅ Verify X credential format
+- ✅ Save everything to `.env`
 
+### 3. Add accounts via Telegram
+Send `/add @username` to your bot — it follows them and enables notifications.
+
+### Re-run setup
 ```bash
-cp .env.example .env
+python3 bot.py --setup
 ```
 
-Edit `.env` with your credentials:
-
-```env
-# X / Twitter Auth
-# Get from browser: DevTools → Application → Cookies → x.com
-X_AUTH_TOKEN=your_auth_token_here
-X_CT0=your_ct0_here
-
-# Telegram
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_CHAT_ID=your_chat_id_here
-```
-
-### 4. Run
-
+### Manual setup (alternative)
+If you prefer editing `.env` directly:
 ```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # then edit with your credentials
 python3 bot.py
 ```
 
@@ -105,24 +105,23 @@ python3 bot.py
 
 ## 🔑 Getting Credentials
 
-### X Auth Token & CT0
+The setup wizard walks you through this interactively. For reference:
 
+### X Auth Token & CT0
 1. Open [x.com](https://x.com) in your browser and log in
 2. Open DevTools (F12) → Application → Cookies → `x.com`
-3. Copy `auth_token` value → paste as `X_AUTH_TOKEN`
-4. Copy `ct0` value → paste as `X_CT0`
+3. Copy `auth_token` value (40-char hex)
+4. Copy `ct0` value (long hex string)
 
 ### Telegram Bot Token
-
 1. Open [@BotFather](https://t.me/BotFather) on Telegram
 2. Send `/newbot` and follow the instructions
-3. Copy the bot token → paste as `TELEGRAM_BOT_TOKEN`
+3. Copy the token (format: `123456:ABC-DEF...`)
 
 ### Telegram Chat ID
-
 1. Send any message to your bot
 2. Visit `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
-3. Find `"chat":{"id":XXXXX}` → paste as `TELEGRAM_CHAT_ID`
+3. Find `"chat":{"id":XXXXX}` — that number is your Chat ID
 
 ---
 
@@ -142,9 +141,11 @@ Send these to your Telegram bot:
 ```
 You: /add elonmusk
 Bot: ⏳ Resolving @elonmusk...
-Bot: ✅ Added Elon Musk (@elonmusk)
+Bot: ✅ Added Elon Musk
+     👤 @elonmusk
      • Followed ✅
      • Notifications 🔔
+     [👤 View Profile]  [🔕 Stop Notify]
 ```
 
 When `@elonmusk` posts:
@@ -152,26 +153,27 @@ When `@elonmusk` posts:
 ```
 Bot: 🔔 New Post
      👤 Elon Musk (@elonmusk)
-     
-     📝 The thing about gravity is...
-     🕐 2026-03-27 14:30
-     
-     [🔗 Go to Post]
-```
 
+     📝 The thing about gravity is...
+
+     🕐 Mar 27, 2026 · 14:30 UTC
+
+     [🔗 Go to Post]  [🔕 Stop Notify]
+```
 ---
 
 ## 📁 File Structure
 
 ```
 x-tg-notify/
-├── bot.py              # Main bot script
-├── .env.example        # Example credentials template
-├── .env                # Your credentials (git-ignored)
+├── bot.py              # Main bot (setup wizard + runtime)
+├── requirements.txt    # Python dependencies
+├── .env.example        # Credential template with instructions
+├── .env                # Your credentials (git-ignored, auto-created by wizard)
+├── venv/               # Virtual environment (auto-created by wizard)
 ├── watchlist.json      # Watched users (auto-created)
 ├── seen_state.json     # Dedup state (auto-created)
-├── README.md           # This file
-└── LICENSE             # MIT License
+└── README.md
 ```
 
 ---
@@ -278,7 +280,7 @@ MIT License — see [LICENSE](LICENSE) file.
 
 - [curl_cffi](https://github.com/yifeikong/curl_cffi) — TLS fingerprint impersonation
 - [XClientTransaction](https://github.com/iSarabjitDhiman/XClientTransaction) — X anti-detection headers
-- [twitter-cli](https://github.com/yifeikong/twitter-cli) — X API CLI tool
+
 
 ---
 

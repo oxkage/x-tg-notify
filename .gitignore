@@ -1,7 +1,34 @@
+# Credentials
 .env
-__pycache__/
-*.pyc
+.env.local
+.env.production
+
+# Runtime data
 watchlist.json
 seen_state.json
+transaction_cache.json
+notif_debug.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
 venv/
+.venv/
+
+# Logs
 *.log
+
+# Dev notes
+NOTE.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
