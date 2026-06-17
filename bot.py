@@ -406,6 +406,7 @@ class RateLimiter:
         self._backoff[key] = 0
 
     def mark_fail(self, key: str, max_backoff: float = 60):
+        self._last[key] = time.time()  # anchor backoff timer to the moment of failure
         self._backoff[key] = min(self._backoff.get(key, 0) * 2 + 1, max_backoff)
         log.warning(f"Rate limit backoff for {key}: {self._backoff[key]:.0f}s")
 
@@ -425,6 +426,9 @@ def format_tweet_time(raw: str) -> str:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("x-notify")
+# Silence httpx per-request INFO spam (it drowned the real signal in bot.log).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ── X API ──────────────────────────────────────────────────────────
 from curl_cffi import requests as cffi
@@ -573,7 +577,7 @@ def fetch_notifications(count=40) -> list[dict]:
             })
     return notifs
 
-def fetch_user_tweets(user_id: str, count=5) -> list[dict]:
+def fetch_user_tweets(user_id: str, count=5, rl_key: str = "tweets") -> list[dict]:
     v = json.dumps({
         "userId": user_id, "count": count,
         "includePromotedContent": False,
@@ -584,9 +588,9 @@ def fetch_user_tweets(user_id: str, count=5) -> list[dict]:
     url = f"https://x.com/i/api/graphql/{USER_TWEETS_QUERY_ID}/UserTweets?variables={urllib.parse.quote(v)}&features={urllib.parse.quote(f)}"
     r = get_x_session().get(url, headers=xh(url), timeout=15)
     if r.status_code == 200:
-        _rate.mark_ok("tweets")
+        _rate.mark_ok(rl_key)
     elif r.status_code == 429:
-        _rate.mark_fail("tweets")
+        _rate.mark_fail(rl_key)
         return []
     else:
         log.warning(f"UserTweets failed: {r.status_code}")
@@ -837,7 +841,7 @@ async def tg_get_updates(offset=0):
     return []
 
 # ── Commands ────────────────────────────────────────────────────────
-async def handle_cmd(text, chat_id, watchlist, settings):
+async def handle_cmd(text, chat_id, watchlist, settings, seen_tweet_ids=None):
     parts = text.strip().split()
     cmd = parts[0].lower()
 
@@ -860,6 +864,31 @@ async def handle_cmd(text, chat_id, watchlist, settings):
         notif_ok = enable_notifs(uid)
         watchlist[uname] = {"id": uid, "name": name, "added": datetime.now().isoformat()}
         save_watchlist(watchlist)
+
+        # Seed seen_state so we DON'T flood old posts. Baseline = newest existing tweet.
+        if seen_tweet_ids is not None:
+            try:
+                existing = fetch_user_tweets(uid, 10, rl_key=f"tweets:{uname}")
+                baseline = "0"
+                for t in existing:
+                    if t.get("is_retweet"):
+                        continue
+                    if t["id"] > baseline:
+                        baseline = t["id"]
+                # If we couldn't read the timeline (rate-limited/empty), use a snowflake
+                # floor for "now" instead of "0" so we never dump the whole back-catalogue.
+                # Twitter snowflake = ((ms_since_twitter_epoch) << 22); epoch = 1288834974657.
+                if baseline == "0":
+                    now_ms = int(time.time() * 1000)
+                    baseline = str((now_ms - 1288834974657) << 22)
+                seen_tweet_ids[uname] = baseline
+                save_seen({"seen_tweet_ids": seen_tweet_ids})
+                log.info(f"Seeded @{uname} on add: {baseline}")
+            except Exception as e:
+                log.warning(f"Seed-on-add failed for @{uname}: {e}")
+                now_ms = int(time.time() * 1000)
+                seen_tweet_ids[uname] = str((now_ms - 1288834974657) << 22)  # snowflake floor = now
+
         icon = "🔔" if notif_ok else "🔕"
         await tg_send(
             f"✅ Added <b>{name}</b>\n"
@@ -914,7 +943,7 @@ async def handle_cmd(text, chat_id, watchlist, settings):
 
     elif cmd == "/settings":
         photo_on = settings.get("photo_enabled", True)
-        video_on = settings.get("video_enabled", True)
+        video_on = settings.get("video_enabled", False)
         gif_on = settings.get("gif_enabled", True)
         buttons = [
             [{"text": f"📷 Photo: {'ON 🟢' if photo_on else 'OFF 🔴'}", "callback_data": "toggle_photo"}],
@@ -972,7 +1001,7 @@ async def main():
         if uid:
             wait = _rate.wait_time(f"seed:{uname}", 1)
             if wait > 0: await asyncio.sleep(wait)
-            tweets = fetch_user_tweets(uid, 10)
+            tweets = fetch_user_tweets(uid, 10, rl_key=f"tweets:{uname}")
             if tweets:
                 for t in tweets:
                     if not t.get("is_retweet"):
@@ -1034,7 +1063,7 @@ async def main():
                         await tg_answer_callback(cb_id, f"{emoji} {media_type.title()}: {state}")
                         # Rebuild buttons
                         photo_on = settings.get("photo_enabled", True)
-                        video_on = settings.get("video_enabled", True)
+                        video_on = settings.get("video_enabled", False)
                         gif_on = settings.get("gif_enabled", True)
                         buttons = [
                             [{"text": f"📷 Photo: {'ON 🟢' if photo_on else 'OFF 🔴'}", "callback_data": "toggle_photo"}],
@@ -1057,7 +1086,7 @@ async def main():
                 text = msg.get("text", "")
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if text.startswith("/"):
-                    await handle_cmd(text, chat_id, watchlist, settings)
+                    await handle_cmd(text, chat_id, watchlist, settings, seen_tweet_ids)
                     id_to_uname = {}
                     for un, info in watchlist.items():
                         uid = info.get("id", "")
@@ -1107,7 +1136,7 @@ async def main():
                     if tw_wait > 0:
                         await asyncio.sleep(tw_wait)
 
-                    tweets = fetch_user_tweets(uid, 10)
+                    tweets = fetch_user_tweets(uid, 10, rl_key=f"tweets:{matched}")
                     if not tweets:
                         continue
 
@@ -1187,7 +1216,7 @@ async def main():
                 tw_wait = _rate.wait_time(f"tweets:{uname}", 10)
                 if tw_wait > 0: await asyncio.sleep(tw_wait)
                 try:
-                    tweets = fetch_user_tweets(uid, 10)
+                    tweets = fetch_user_tweets(uid, 10, rl_key=f"tweets:{uname}")
                     if not tweets: continue
                     last_seen = seen_tweet_ids.get(uname, "0")
                     new_tweets = []
