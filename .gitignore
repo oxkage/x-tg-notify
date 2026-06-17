@@ -34,3 +34,6 @@ Thumbs.db
 *.swo
 settings.json
 .bot.pid
+
+# Runtime query-ID cache
+query_ids.json

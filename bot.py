@@ -4,7 +4,7 @@ x-tg-notify — Real-time X notification forwarder to Telegram bot.
 Run: python3 bot.py          (auto-setup on first run)
      python3 bot.py --setup  (re-run setup wizard)
 """
-import json, os, sys, time, asyncio, urllib.parse, logging, shutil, subprocess
+import json, os, sys, time, asyncio, urllib.parse, logging, shutil, subprocess, re
 from datetime import datetime
 from pathlib import Path
 
@@ -39,9 +39,49 @@ def release_lock():
         pass
 
 BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
-NOTIF_QUERY_ID = "ZhJlpN0aKcSkccG5Pz1MEw"
-USER_TWEETS_QUERY_ID = "V7H0Ap3_Hh2FyS75OCDO3Q"
-USER_BY_SCREEN_NAME_QUERY_ID = "1VOOyvKkiI3FMmkeDNxM9A"
+
+# ── GraphQL Query IDs ────────────────────────────────────────────────
+# X rotates these every few weeks. We ship known-good defaults, cache the
+# live values to query_ids.json, refresh on staleness, and self-heal on 404.
+# All List ops + UserTweets + UserByScreenName live in one main.<hash>.js
+# bundle reachable in 2 requests; NotificationsTimeline is lazy-loaded so it
+# keeps its hardcoded default (the notif path is a cheap optional secondary).
+QUERY_IDS_FILE = BASE_DIR / "query_ids.json"
+DEFAULT_QUERY_IDS = {
+    "NotificationsTimeline": "ZhJlpN0aKcSkccG5Pz1MEw",
+    "UserTweets": "V7H0Ap3_Hh2FyS75OCDO3Q",
+    "UserByScreenName": "1VOOyvKkiI3FMmkeDNxM9A",
+    "ListLatestTweetsTimeline": "27HKUy8ulrflZ9Tole038g",
+    "ListAddMember": "E5PskyoAL2YZ6PsJDebfWg",
+    "ListRemoveMember": "LNR-rIOOs8to-dcgUhLndw",
+    "ListMembers": "H_0zFfjp73xGZrJpY-C2IQ",
+}
+# Ops that should trigger a scrape if missing/stale (all live in main.js).
+SCRAPEABLE_OPS = ["UserTweets", "UserByScreenName", "ListLatestTweetsTimeline",
+                  "ListAddMember", "ListRemoveMember", "ListMembers"]
+QUERY_IDS = dict(DEFAULT_QUERY_IDS)
+_qid_scraped_at = 0.0
+
+def load_query_ids():
+    """Load cached query IDs, merged over defaults."""
+    global QUERY_IDS, _qid_scraped_at
+    QUERY_IDS = dict(DEFAULT_QUERY_IDS)
+    if QUERY_IDS_FILE.exists():
+        try:
+            cached = json.loads(QUERY_IDS_FILE.read_text())
+            _qid_scraped_at = cached.pop("_scraped_at", 0.0)
+            QUERY_IDS.update({k: v for k, v in cached.items() if v})
+        except Exception:
+            pass
+    return QUERY_IDS
+
+def save_query_ids():
+    data = dict(QUERY_IDS)
+    data["_scraped_at"] = _qid_scraped_at
+    _atomic_write(QUERY_IDS_FILE, json.dumps(data, indent=2))
+
+def qid(name: str) -> str:
+    return QUERY_IDS.get(name, DEFAULT_QUERY_IDS.get(name, ""))
 
 NOTIF_FEATURES = {
     "rweb_video_screen_enabled": False,
@@ -72,6 +112,7 @@ TWEET_FEATURES = {
 
 POLL_INTERVAL = 5
 TIMELINE_INTERVAL = 60
+LIST_POLL_INTERVAL = 3   # primary: poll the List timeline every N seconds (flat cost)
 REQUIRED_ENV = ["X_AUTH_TOKEN", "X_CT0", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
 
 # ── Runtime Stats ──────────────────────────────────────────────────
@@ -352,6 +393,9 @@ AUTH_TOKEN = ENV.get("X_AUTH_TOKEN", "")
 CT0 = ENV.get("X_CT0", "")
 TG_TOKEN = ENV.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = ENV.get("TELEGRAM_CHAT_ID", "")
+# Optional: X List ID used for flat-cost timeline polling (the primary fetch path).
+# When set, the bot polls this one List instead of N per-user timelines.
+LIST_ID = ENV.get("X_LIST_ID", "").strip()
 
 def load_watchlist():
     if WATCHLIST_FILE.exists():
@@ -467,6 +511,44 @@ def get_ct():
             log.error(f"CT refresh failed: {e}")
     return _ct
 
+QID_MAX_AGE = 86400  # re-scrape query IDs if cache older than 24h
+
+def scrape_query_ids(force=False) -> bool:
+    """Scrape live GraphQL query IDs from x.com's main.<hash>.js bundle.
+    Returns True if any ID changed. All scrapeable ops live in one bundle.
+    """
+    global QUERY_IDS, _qid_scraped_at
+    if not force and (time.time() - _qid_scraped_at) < QID_MAX_AGE:
+        return False
+    try:
+        s = get_x_session()
+        ct_headers = generate_headers()
+        home = s.get("https://x.com", headers=ct_headers, timeout=15)
+        html = home.text
+        # main bundle URL is embedded directly in the HTML
+        m = re.search(r'https://abs\.twimg\.com/responsive-web/[^"\s]+?/main\.[a-f0-9]+\.js', html)
+        if not m:
+            log.warning("scrape_query_ids: main.js URL not found in HTML")
+            return False
+        main_js = s.get(m.group(0), headers=ct_headers, timeout=20).text
+        changed = False
+        for op in SCRAPEABLE_OPS:
+            mm = re.search(r'queryId:"([\w-]{16,})",operationName:"' + op + '"', main_js)
+            if not mm:
+                mm = re.search(r'operationName:"' + op + r'",[^}]*?queryId:"([\w-]{16,})"', main_js)
+            if mm and mm.group(1) != QUERY_IDS.get(op):
+                QUERY_IDS[op] = mm.group(1)
+                changed = True
+        _qid_scraped_at = time.time()
+        save_query_ids()
+        if changed:
+            log.info(f"Query IDs refreshed from main.js: { {k: QUERY_IDS[k] for k in SCRAPEABLE_OPS} }")
+        return changed
+    except Exception as e:
+        log.warning(f"scrape_query_ids failed: {e}")
+        return False
+
+
 def xh(url="", method="GET"):
     h = {
         "Authorization": f"Bearer {BEARER}",
@@ -488,7 +570,7 @@ def resolve_user(username: str) -> dict | None:
     username = username.lstrip("@")
     v = json.dumps({"screen_name": username}, separators=(",", ":"))
     f = json.dumps({"responsive_web_graphql_exclude_directive_enabled": True}, separators=(",", ":"))
-    url = f"https://x.com/i/api/graphql/{USER_BY_SCREEN_NAME_QUERY_ID}/UserByScreenName?variables={urllib.parse.quote(v)}&features={urllib.parse.quote(f)}"
+    url = f"https://x.com/i/api/graphql/{qid('UserByScreenName')}/UserByScreenName?variables={urllib.parse.quote(v)}&features={urllib.parse.quote(f)}"
     r = get_x_session().get(url, headers=xh(url), timeout=15)
     if r.status_code == 200:
         result = r.json().get("data", {}).get("user", {}).get("result", {})
@@ -543,7 +625,7 @@ def disable_notifs(uid: str) -> bool:
 def fetch_notifications(count=40) -> list[dict]:
     v = json.dumps({"timeline_type": "All", "count": count}, separators=(",", ":"))
     f = json.dumps(NOTIF_FEATURES, separators=(",", ":"))
-    url = f"https://x.com/i/api/graphql/{NOTIF_QUERY_ID}/NotificationsTimeline?variables={urllib.parse.quote(v)}&features={urllib.parse.quote(f)}"
+    url = f"https://x.com/i/api/graphql/{qid('NotificationsTimeline')}/NotificationsTimeline?variables={urllib.parse.quote(v)}&features={urllib.parse.quote(f)}"
     r = get_x_session().get(url, headers=xh(url), timeout=15)
     if r.status_code == 429:
         _rate.mark_fail("notif")
@@ -577,6 +659,104 @@ def fetch_notifications(count=40) -> list[dict]:
             })
     return notifs
 
+def _extract_tweet(tweet_result: dict) -> dict | None:
+    """Parse a single GraphQL tweet_result into our normalized tweet dict.
+    Shared by UserTweets and ListLatestTweetsTimeline. Adds reply detection:
+    a tweet is a reply when it replies to SOMEONE ELSE; replying to your own
+    tweet (self-thread) is treated as a post per spec.
+    """
+    if tweet_result.get("__typename") == "TweetWithVisibilityResults":
+        tweet_result = tweet_result.get("tweet", {})
+    legacy = tweet_result.get("legacy", {})
+    if not legacy.get("full_text"):
+        return None
+
+    author_id = legacy.get("user_id_str", "")
+    media_list = []
+    photo_url = video_url = gif_url = None
+
+    def _scan_media(src_legacy):
+        nonlocal photo_url, video_url, gif_url
+        for m in src_legacy.get("extended_entities", {}).get("media", []):
+            url_m = m.get("media_url_https")
+            if not url_m:
+                continue
+            mtype = m.get("type", "")
+            media_list.append({"type": mtype, "url": url_m})
+            if not photo_url and mtype == "photo":
+                photo_url = url_m
+            elif not video_url and mtype == "video":
+                variants = m.get("video_info", {}).get("variants", [])
+                best_v = max((v for v in variants if v.get("content_type") == "video/mp4"),
+                             key=lambda v: v.get("bitrate", 0), default=None)
+                if best_v and best_v.get("url"):
+                    video_url = best_v["url"]  # KEEP ?tag= auth params
+            elif not gif_url and mtype == "animated_gif":
+                variants = m.get("video_info", {}).get("variants", [])
+                if variants and variants[0].get("url"):
+                    gif_url = variants[0]["url"]
+
+    _scan_media(legacy)
+
+    user_result = tweet_result.get("core", {}).get("user_results", {}).get("result", {})
+    u_legacy = user_result.get("legacy", {}) if user_result else {}
+    # X moved screen_name/name into user_results.result.core (nested); fall back to legacy.
+    u_core = user_result.get("core", {}) if user_result else {}
+
+    is_rt = bool(legacy.get("retweeted_status_result"))
+    is_quote = bool(legacy.get("is_quote_status")) and bool(legacy.get("quoted_status_result"))
+    quote_text = quote_user = ""
+    if is_quote:
+        q_result = legacy["quoted_status_result"].get("result", {})
+        if q_result.get("__typename") == "TweetWithVisibilityResults":
+            q_result = q_result.get("tweet", {})
+        q_legacy = q_result.get("legacy", {})
+        q_user_res = q_result.get("core", {}).get("user_results", {}).get("result", {})
+        quote_text = q_legacy.get("full_text", "")
+        quote_user = (q_user_res.get("core", {}).get("screen_name")
+                      or q_user_res.get("legacy", {}).get("screen_name", ""))
+
+    # Reply detection (only for non-RTs). Self-thread = post.
+    reply_to_uid = legacy.get("in_reply_to_user_id_str", "")
+    is_reply = (not is_rt) and bool(legacy.get("in_reply_to_status_id_str")) \
+               and reply_to_uid and reply_to_uid != author_id
+
+    if is_rt:
+        rt_result = legacy["retweeted_status_result"].get("result", {})
+        if rt_result.get("__typename") == "TweetWithVisibilityResults":
+            rt_result = rt_result.get("tweet", {})
+        rt_legacy = rt_result.get("legacy", {})
+        rt_user_res = rt_result.get("core", {}).get("user_results", {}).get("result", {})
+        rt_core = rt_user_res.get("core", {})
+        rt_legacy_u = rt_user_res.get("legacy", {})
+        text = rt_legacy.get("full_text", legacy.get("full_text", ""))
+        user_screen = rt_core.get("screen_name") or rt_legacy_u.get("screen_name", "")
+        user_name = rt_core.get("name") or rt_legacy_u.get("name", "")
+        if not media_list:
+            _scan_media(rt_legacy)
+    else:
+        text = legacy.get("full_text", "")
+        user_screen = u_core.get("screen_name") or u_legacy.get("screen_name", "")
+        user_name = u_core.get("name") or u_legacy.get("name", "")
+
+    return {
+        "id": legacy.get("id_str", ""),
+        "text": text,
+        "user": user_screen,
+        "user_name": user_name,
+        "author_id": author_id,
+        "created": legacy.get("created_at", ""),
+        "is_retweet": is_rt,
+        "is_quote": is_quote,
+        "is_reply": is_reply,
+        "quote_text": quote_text,
+        "quote_user": quote_user,
+        "photo_url": photo_url,
+        "video_url": video_url,
+        "gif_url": gif_url,
+        "media": media_list,
+    }
+
 def fetch_user_tweets(user_id: str, count=5, rl_key: str = "tweets") -> list[dict]:
     v = json.dumps({
         "userId": user_id, "count": count,
@@ -585,12 +765,16 @@ def fetch_user_tweets(user_id: str, count=5, rl_key: str = "tweets") -> list[dic
         "withVoice": True, "withV2Timeline": True,
     }, separators=(",", ":"))
     f = json.dumps(TWEET_FEATURES, separators=(",", ":"))
-    url = f"https://x.com/i/api/graphql/{USER_TWEETS_QUERY_ID}/UserTweets?variables={urllib.parse.quote(v)}&features={urllib.parse.quote(f)}"
+    url = f"https://x.com/i/api/graphql/{qid('UserTweets')}/UserTweets?variables={urllib.parse.quote(v)}&features={urllib.parse.quote(f)}"
     r = get_x_session().get(url, headers=xh(url), timeout=15)
     if r.status_code == 200:
         _rate.mark_ok(rl_key)
     elif r.status_code == 429:
         _rate.mark_fail(rl_key)
+        return []
+    elif r.status_code == 404:
+        log.warning("UserTweets 404 — query id may be stale, triggering re-scrape")
+        scrape_query_ids(force=True)
         return []
     else:
         log.warning(f"UserTweets failed: {r.status_code}")
@@ -598,111 +782,83 @@ def fetch_user_tweets(user_id: str, count=5, rl_key: str = "tweets") -> list[dic
 
     data = r.json()
     instructions = data.get("data", {}).get("user", {}).get("result", {}).get("timeline_v2", {}).get("timeline", {}).get("instructions", [])
-
     tweets = []
     for inst in instructions:
         for entry in inst.get("entries", []):
             content = entry.get("content", {})
-            if content.get("entryType") != "TimelineTimelineItem": continue
-            item = content.get("itemContent", {})
-            tweet_result = item.get("tweet_results", {}).get("result", {})
-            if tweet_result.get("__typename") == "TweetWithVisibilityResults":
-                tweet_result = tweet_result.get("tweet", {})
-            legacy = tweet_result.get("legacy", {})
-            if not legacy.get("full_text"): continue
-
-            media_list = []
-            photo_url = None
-            video_url = None
-            gif_url = None
-            for m in legacy.get("extended_entities", {}).get("media", []):
-                url_m = m.get("media_url_https")
-                if not url_m: continue
-                mtype = m.get("type", "")
-                media_list.append({"type": mtype, "url": url_m})
-                if not photo_url and mtype == "photo":
-                    photo_url = url_m
-                elif not video_url and mtype == "video":
-                    # Get highest bitrate video URL
-                    variants = m.get("video_info", {}).get("variants", [])
-                    best_v = max((v for v in variants if v.get("content_type") == "video/mp4"),
-                                 key=lambda v: v.get("bitrate", 0), default=None)
-                    if best_v:
-                        raw_url = best_v.get("url", "")
-                        # Strip query params — Telegram can't handle them
-                        video_url = raw_url if raw_url else None
-                elif not gif_url and mtype == "animated_gif":
-                    variants = m.get("video_info", {}).get("variants", [])
-                    if variants:
-                        raw_url = variants[0].get("url", "")
-                        gif_url = raw_url if raw_url else None
-
-            user_result = tweet_result.get("core", {}).get("user_results", {}).get("result", {})
-            u_legacy = user_result.get("legacy", {}) if user_result else {}
-
-            is_rt = bool(legacy.get("retweeted_status_result"))
-            is_quote = bool(legacy.get("is_quote_status")) and legacy.get("quoted_status_result")
-            quote_text = ""
-            quote_user = ""
-            if is_quote:
-                q_result = legacy["quoted_status_result"].get("result", {})
-                if q_result.get("__typename") == "TweetWithVisibilityResults":
-                    q_result = q_result.get("tweet", {})
-                q_legacy = q_result.get("legacy", {})
-                q_user = q_result.get("core", {}).get("user_results", {}).get("result", {}).get("legacy", {})
-                quote_text = q_legacy.get("full_text", "")
-                quote_user = q_user.get("screen_name", "")
-
-            if is_rt:
-                rt_result = legacy["retweeted_status_result"].get("result", {})
-                if rt_result.get("__typename") == "TweetWithVisibilityResults":
-                    rt_result = rt_result.get("tweet", {})
-                rt_legacy = rt_result.get("legacy", {})
-                rt_user = rt_result.get("core", {}).get("user_results", {}).get("result", {}).get("legacy", {})
-                text = rt_legacy.get("full_text", legacy.get("full_text", ""))
-                user_screen = rt_user.get("screen_name", "")
-                user_name = rt_user.get("name", "")
-                if not media_list:
-                    for m in rt_legacy.get("extended_entities", {}).get("media", []):
-                        url_m = m.get("media_url_https")
-                        if not url_m: continue
-                        mtype = m.get("type", "")
-                        media_list.append({"type": mtype, "url": url_m})
-                        if not photo_url and mtype == "photo":
-                            photo_url = url_m
-                        elif not video_url and mtype == "video":
-                            variants = m.get("video_info", {}).get("variants", [])
-                            best_v = max((v for v in variants if v.get("content_type") == "video/mp4"),
-                                         key=lambda v: v.get("bitrate", 0), default=None)
-                            if best_v:
-                                raw_url = best_v.get("url", "")
-                                video_url = raw_url if raw_url else None
-                        elif not gif_url and mtype == "animated_gif":
-                            variants = m.get("video_info", {}).get("variants", [])
-                            if variants:
-                                raw_url = variants[0].get("url", "")
-                                gif_url = raw_url if raw_url else None
-            else:
-                text = legacy.get("full_text", "")
-                user_screen = u_legacy.get("screen_name", "")
-                user_name = u_legacy.get("name", "")
-
-            tweets.append({
-                "id": legacy.get("id_str", ""),
-                "text": text,
-                "user": user_screen,
-                "user_name": user_name,
-                "created": legacy.get("created_at", ""),
-                "is_retweet": is_rt,
-                "is_quote": is_quote,
-                "quote_text": quote_text,
-                "quote_user": quote_user,
-                "photo_url": photo_url,
-                "video_url": video_url,
-                "gif_url": gif_url,
-                "media": media_list,
-            })
+            if content.get("entryType") != "TimelineTimelineItem":
+                continue
+            tweet_result = content.get("itemContent", {}).get("tweet_results", {}).get("result", {})
+            t = _extract_tweet(tweet_result)
+            if t:
+                tweets.append(t)
     return tweets
+
+def fetch_list_timeline(list_id: str, count=40, rl_key: str = "list") -> list[dict]:
+    """Poll ListLatestTweetsTimeline — one request returns newest tweets across
+    ALL list members, time-sorted. Flat cost regardless of member count."""
+    v = json.dumps({"listId": list_id, "count": count}, separators=(",", ":"))
+    f = json.dumps(TWEET_FEATURES, separators=(",", ":"))
+    url = f"https://x.com/i/api/graphql/{qid('ListLatestTweetsTimeline')}/ListLatestTweetsTimeline?variables={urllib.parse.quote(v)}&features={urllib.parse.quote(f)}"
+    r = get_x_session().get(url, headers=xh(url), timeout=15)
+    if r.status_code == 200:
+        _rate.mark_ok(rl_key)
+    elif r.status_code == 429:
+        _rate.mark_fail(rl_key)
+        return []
+    elif r.status_code == 404:
+        log.warning("ListLatestTweetsTimeline 404 — query id stale, triggering re-scrape")
+        scrape_query_ids(force=True)
+        return []
+    elif r.status_code in (401, 403):
+        log.error(f"List timeline auth failed ({r.status_code})")
+        if not AUTH_EXPIRED_SENT:
+            asyncio.get_event_loop().create_task(tg_send_token_refresh_guidance())
+        return []
+    else:
+        log.warning(f"ListLatestTweetsTimeline failed: {r.status_code}")
+        return []
+
+    data = r.json()
+    instructions = data.get("data", {}).get("list", {}).get("tweets_timeline", {}).get("timeline", {}).get("instructions", [])
+    tweets = []
+    for inst in instructions:
+        for entry in inst.get("entries", []):
+            content = entry.get("content", {})
+            if content.get("entryType") != "TimelineTimelineItem":
+                continue
+            tweet_result = content.get("itemContent", {}).get("tweet_results", {}).get("result", {})
+            t = _extract_tweet(tweet_result)
+            if t:
+                tweets.append(t)
+    return tweets
+
+def list_add_member(list_id: str, user_id: str) -> bool:
+    url = f"https://x.com/i/api/graphql/{qid('ListAddMember')}/ListAddMember"
+    h = xh(url, "POST"); h["Content-Type"] = "application/json"
+    payload = {"variables": {"listId": list_id, "userId": str(user_id)}, "queryId": qid("ListAddMember")}
+    r = get_x_session().post(url, headers=h, timeout=15, data=json.dumps(payload))
+    if r.status_code == 200 and r.json().get("data", {}).get("list"):
+        return True
+    if r.status_code == 404:
+        log.warning("ListAddMember 404 — query id stale, re-scraping")
+        scrape_query_ids(force=True)
+    else:
+        log.warning(f"ListAddMember failed: {r.status_code} {r.text[:120]}")
+    return False
+
+def list_remove_member(list_id: str, user_id: str) -> bool:
+    url = f"https://x.com/i/api/graphql/{qid('ListRemoveMember')}/ListRemoveMember"
+    h = xh(url, "POST"); h["Content-Type"] = "application/json"
+    payload = {"variables": {"listId": list_id, "userId": str(user_id)}, "queryId": qid("ListRemoveMember")}
+    r = get_x_session().post(url, headers=h, timeout=15, data=json.dumps(payload))
+    if r.status_code == 200 and r.json().get("data", {}).get("list"):
+        return True
+    if r.status_code == 404:
+        scrape_query_ids(force=True)
+    else:
+        log.warning(f"ListRemoveMember failed: {r.status_code} {r.text[:120]}")
+    return False
 
 # ── Telegram ───────────────────────────────────────────────────────
 import httpx
@@ -716,18 +872,21 @@ async def get_tg() -> httpx.AsyncClient:
     return _tg_client
 
 async def tg_send(text, chat_id=TG_CHAT, photo=None, video=None, animation=None,
-                  button_url=None, button_text="🔗 Go to Post", buttons=None):
+                  button_url=None, button_text="🔗 Go to Post", buttons=None, buttons_grid=None):
     """Send rich formatted message with fallback."""
     await tg_send_rich(text, chat_id=chat_id, photo=photo, video=video,
                        animation=animation, button_url=button_url,
-                       button_text=button_text, buttons=buttons)
+                       button_text=button_text, buttons=buttons, buttons_grid=buttons_grid)
 
 async def tg_send_rich(text, chat_id=TG_CHAT, photo=None, video=None, animation=None,
-                       button_url=None, button_text="🔗 Go to Post", buttons=None):
+                       button_url=None, button_text="🔗 Go to Post", buttons=None, buttons_grid=None):
     """Send rich formatted message with embedded media using sendRichMessage API."""
     c = await get_tg()
     reply_markup = None
-    if buttons:
+    if buttons_grid:
+        # Pre-built list of rows (list[list[button]]).
+        reply_markup = json.dumps({"inline_keyboard": buttons_grid})
+    elif buttons:
         reply_markup = json.dumps({"inline_keyboard": [buttons]})
     elif button_url:
         reply_markup = json.dumps({"inline_keyboard": [[{"text": button_text, "url": button_url}]]})
@@ -785,6 +944,27 @@ async def _tg_send_legacy(text, chat_id=TG_CHAT, photo=None, video=None, animati
     except Exception as e:
         log.warning(f"tg_send_legacy failed: {e}")
 
+async def tg_set_commands():
+    """Register the bot command menu (the '/' button + Menu in Telegram)."""
+    c = await get_tg()
+    commands = [
+        {"command": "add", "description": "Follow a user + add to List"},
+        {"command": "remove", "description": "Unfollow + remove from List"},
+        {"command": "filter", "description": "Toggle posts/replies for a user"},
+        {"command": "list", "description": "Show watched users + filters"},
+        {"command": "status", "description": "Bot status + stats"},
+        {"command": "settings", "description": "Toggle media types"},
+        {"command": "help", "description": "Show help"},
+    ]
+    try:
+        r = await c.post(f"{TG_API}/setMyCommands", json={"commands": commands})
+        if r.status_code == 200 and r.json().get("ok"):
+            log.info("Telegram command menu registered")
+        else:
+            log.warning(f"setMyCommands failed: {r.status_code} {r.text[:120]}")
+    except Exception as e:
+        log.warning(f"setMyCommands error: {e}")
+
 async def tg_answer_callback(callback_id, text="", show_alert=False):
     c = await get_tg()
     try:
@@ -827,10 +1007,13 @@ def format_uptime(seconds: float) -> str:
     else:
         return f"{m}m"
 
-async def tg_get_updates(offset=0):
+async def tg_get_updates(offset=0, timeout=3):
     c = await get_tg()
     try:
-        r = await c.get(f"{TG_API}/getUpdates", params={"offset": offset, "timeout": 3})
+        # HTTP read timeout must exceed the long-poll timeout.
+        r = await c.get(f"{TG_API}/getUpdates",
+                        params={"offset": offset, "timeout": timeout},
+                        timeout=timeout + 10)
         if r.status_code == 200:
             return r.json().get("result", [])
         elif r.status_code == 409:
@@ -841,7 +1024,82 @@ async def tg_get_updates(offset=0):
     return []
 
 # ── Commands ────────────────────────────────────────────────────────
-async def handle_cmd(text, chat_id, watchlist, settings, seen_tweet_ids=None):
+async def handle_callback(cb, watchlist, settings, seen_tweet_ids, rebuild_id_map, list_active):
+    """Handle an inline-button callback_query."""
+    cb_data = cb.get("data", "")
+    cb_id = cb.get("id", "")
+    cb_chat = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+    cb_msg_id = cb.get("message", {}).get("message_id")
+
+    if cb_data.startswith("stop:"):
+        uname = cb_data.split(":", 1)[1]
+        if uname in watchlist:
+            uid = watchlist[uname]["id"]
+            name = watchlist[uname]["name"]
+            disable_notifs(uid); await asyncio.sleep(0.5)
+            unfollow_user(uid)
+            if list_active and LIST_ID:
+                list_remove_member(LIST_ID, uid)
+            del watchlist[uname]; save_watchlist(watchlist)
+            rebuild_id_map()
+            await tg_answer_callback(cb_id, f"🔕 Stopped @{uname}")
+            await tg_send(f"🔕 Stopped <b>{name}</b> (@{uname})\n• Unfollowed\n• Removed from List", cb_chat)
+            log.info(f"Stop notify: @{uname}")
+        else:
+            await tg_answer_callback(cb_id, f"@{uname} not in watchlist", show_alert=True)
+        return
+
+    if cb_data.startswith("filt:"):
+        # filt:<posts|replies>:<uname>
+        _, which, uname = cb_data.split(":", 2)
+        if uname not in watchlist:
+            await tg_answer_callback(cb_id, f"@{uname} not in watchlist", show_alert=True)
+            return
+        info = ensure_filter_flags(watchlist[uname])
+        info[which] = not bool(info.get(which, which == "posts"))
+        save_watchlist(watchlist)
+        state = "ON 🟢" if info[which] else "OFF 🔴"
+        label = "Posts" if which == "posts" else "Replies"
+        await tg_answer_callback(cb_id, f"{label}: {state}")
+        # Rebuild the filter keyboard in place.
+        c = await get_tg()
+        try:
+            await c.post(f"{TG_API}/editMessageReplyMarkup", json={
+                "chat_id": cb_chat,
+                "message_id": cb_msg_id,
+                "reply_markup": {"inline_keyboard": build_filter_buttons(uname, info)},
+            })
+        except Exception as e:
+            log.warning(f"edit filter markup failed: {e}")
+        return
+
+    if cb_data.startswith("toggle_"):
+        media_type = cb_data.split("_", 1)[1]
+        key = f"{media_type}_enabled"
+        settings[key] = not settings.get(key, False)
+        save_settings(settings)
+        emoji = "📷" if media_type == "photo" else "🎬" if media_type == "video" else "🎞"
+        state = "ON 🟢" if settings[key] else "OFF 🔴"
+        await tg_answer_callback(cb_id, f"{emoji} {media_type.title()}: {state}")
+        photo_on = settings.get("photo_enabled", True)
+        video_on = settings.get("video_enabled", False)
+        gif_on = settings.get("gif_enabled", True)
+        buttons = [
+            [{"text": f"📷 Photo: {'ON 🟢' if photo_on else 'OFF 🔴'}", "callback_data": "toggle_photo"}],
+            [{"text": f"🎬 Video: {'ON 🟢' if video_on else 'OFF 🔴'}", "callback_data": "toggle_video"}],
+            [{"text": f"🎞 GIF: {'ON 🟢' if gif_on else 'OFF 🔴'}", "callback_data": "toggle_gif"}],
+        ]
+        c = await get_tg()
+        try:
+            await c.post(f"{TG_API}/editMessageReplyMarkup", json={
+                "chat_id": cb_chat, "message_id": cb_msg_id,
+                "reply_markup": {"inline_keyboard": buttons},
+            })
+        except Exception as e:
+            log.warning(f"edit media markup failed: {e}")
+        return
+
+async def handle_cmd(text, chat_id, watchlist, settings, seen_tweet_ids=None, list_active=False):
     parts = text.strip().split()
     cmd = parts[0].lower()
 
@@ -862,7 +1120,16 @@ async def handle_cmd(text, chat_id, watchlist, settings, seen_tweet_ids=None):
 
         await asyncio.sleep(1)
         notif_ok = enable_notifs(uid)
-        watchlist[uname] = {"id": uid, "name": name, "added": datetime.now().isoformat()}
+
+        # Add to the X List (primary polling path) when configured.
+        list_ok = False
+        if list_active and LIST_ID:
+            list_ok = list_add_member(LIST_ID, uid)
+
+        # New entries default to posts ON, replies OFF.
+        watchlist[uname] = ensure_filter_flags(
+            {"id": uid, "name": name, "added": datetime.now().isoformat()}
+        )
         save_watchlist(watchlist)
 
         # Seed seen_state so we DON'T flood old posts. Baseline = newest existing tweet.
@@ -890,15 +1157,16 @@ async def handle_cmd(text, chat_id, watchlist, settings, seen_tweet_ids=None):
                 seen_tweet_ids[uname] = str((now_ms - 1288834974657) << 22)  # snowflake floor = now
 
         icon = "🔔" if notif_ok else "🔕"
+        list_line = ""
+        if list_active:
+            list_line = f"\n• List {'✅' if list_ok else '⚠️ failed'}"
         await tg_send(
             f"✅ Added <b>{name}</b>\n"
             f"👤 <a href=\"https://x.com/{uname}\">@{uname}</a>\n"
-            f"• Followed ✅\n• Notifications {icon}",
+            f"• Followed ✅\n• Notifications {icon}{list_line}\n\n"
+            f"Pick what to forward:",
             chat_id,
-            buttons=[
-                {"text": "👤 View Profile", "url": f"https://x.com/{uname}"},
-                {"text": "🔕 Stop Notify", "callback_data": f"stop:{uname}"},
-            ]
+            buttons_grid=build_filter_buttons(uname, watchlist[uname]),
         )
 
     elif cmd == "/remove" and len(parts) >= 2:
@@ -908,16 +1176,33 @@ async def handle_cmd(text, chat_id, watchlist, settings, seen_tweet_ids=None):
         uid = watchlist[uname]["id"]; name = watchlist[uname]["name"]
         disable_notifs(uid); await asyncio.sleep(0.5)
         unfollow_user(uid)
+        if list_active and LIST_ID:
+            list_remove_member(LIST_ID, uid)
         del watchlist[uname]; save_watchlist(watchlist)
-        await tg_send(f"✅ Removed <b>{name}</b> (@{uname})\n• Notifications OFF 🔕\n• Unfollowed", chat_id)
+        await tg_send(f"✅ Removed <b>{name}</b> (@{uname})\n• Notifications OFF 🔕\n• Unfollowed\n• Removed from List", chat_id)
 
     elif cmd == "/list":
         if not watchlist:
             await tg_send("📋 Watchlist empty.\nUse /add @username.", chat_id); return
         lines = ["📋 <b>Watchlist:</b>"]
         for i, (u, info) in enumerate(watchlist.items(), 1):
-            lines.append(f"  {i}. <b>{info['name']}</b> — <a href=\"https://x.com/{u}\">@{u}</a>")
+            ensure_filter_flags(info)
+            p = "📝" if info.get("posts", True) else "▫️"
+            rp = "💬" if info.get("replies", False) else "▫️"
+            lines.append(f"  {i}. <b>{info['name']}</b> — <a href=\"https://x.com/{u}\">@{u}</a>  {p}{rp}")
+        lines.append("\n<i>📝=posts 💬=replies. Use /filter @user to change.</i>")
         await tg_send("\n".join(lines), chat_id)
+
+    elif cmd == "/filter" and len(parts) >= 2:
+        uname = parts[1].lstrip("@")
+        if uname not in watchlist:
+            await tg_send(f"⚠️ @{uname} not in watchlist.", chat_id); return
+        info = ensure_filter_flags(watchlist[uname])
+        await tg_send(
+            f"🎛 <b>Filter for @{uname}</b>\n\nToggle what gets forwarded:",
+            chat_id,
+            buttons_grid=build_filter_buttons(uname, info),
+        )
 
     elif cmd == "/status":
         uptime = format_uptime(time.time() - START_TIME)
@@ -966,317 +1251,265 @@ async def handle_cmd(text, chat_id, watchlist, settings, seen_tweet_ids=None):
             "**Commands:**\n\n"
             "| Command | Description |\n"
             "|---------|-------------|\n"
-            "| `/add @username` | Follow + notify ON |\n"
-            "| `/remove @username` | Unfollow + notify OFF |\n"
-            "| `/list` | Show watched users |\n"
+            "| `/add @username` | Follow + add to List + notify |\n"
+            "| `/remove @username` | Unfollow + remove from List |\n"
+            "| `/filter @username` | Toggle posts/replies for a user |\n"
+            "| `/list` | Show watched users + filters |\n"
             "| `/status` | Bot status + stats |\n"
             "| `/settings` | Toggle media types |\n"
             "| `/help` | Show this message |\n\n"
             "---\n\n"
-            "**Inline buttons:**\n"
-            "• 🔗 Go to Post — opens tweet\n"
-            "• 🔕 Stop Notify — remove from watchlist\n\n"
-            "Posts are always forwarded. Media toggles only control attachments.",
+            "**Per-user filters:** at `/add` (or `/filter`) toggle 📝 Posts / 💬 Replies. "
+            "Default: posts ON, replies OFF. Self-threads count as posts.\n\n"
+            "Media toggles (`/settings`) only control attachments, never block a post.",
             chat_id
         )
 
 # ── Main ────────────────────────────────────────────────────────────
+def ensure_filter_flags(info: dict) -> dict:
+    """Backfill per-user filter flags on a watchlist entry. Default posts ON,
+    replies OFF (low-noise default)."""
+    if "posts" not in info:
+        info["posts"] = True
+    if "replies" not in info:
+        info["replies"] = False
+    return info
+
+def passes_filter(tweet: dict, info: dict) -> bool:
+    """Apply a watched user's post/reply filter. Retweets & quotes follow the
+    'posts' flag (they're not replies). Self-threads are posts (handled in
+    _extract_tweet). A reply only forwards when replies flag is ON."""
+    if tweet.get("is_reply"):
+        return bool(info.get("replies", False))
+    return bool(info.get("posts", True))
+
+def build_filter_buttons(uname: str, info: dict) -> list:
+    """Inline keyboard rows for toggling a user's post/reply filters."""
+    posts_on = bool(info.get("posts", True))
+    replies_on = bool(info.get("replies", False))
+    return [
+        [
+            {"text": f"📝 Posts: {'ON 🟢' if posts_on else 'OFF 🔴'}", "callback_data": f"filt:posts:{uname}"},
+            {"text": f"💬 Replies: {'ON 🟢' if replies_on else 'OFF 🔴'}", "callback_data": f"filt:replies:{uname}"},
+        ],
+        [
+            {"text": "👤 View Profile", "url": f"https://x.com/{uname}"},
+            {"text": "🔕 Stop Notify", "callback_data": f"stop:{uname}"},
+        ],
+    ]
+
+async def forward_tweet(tweet: dict, uname: str, info: dict, settings: dict):
+    """Render + send one tweet to Telegram, honoring media settings."""
+    global FORWARDED_COUNT
+    name = info.get("name", uname)
+    tid = tweet["id"]
+    tweet_url = f"https://x.com/{uname}/status/{tid}"
+    profile_url = f"https://x.com/{uname}"
+    post_time = format_tweet_time(tweet.get("created", ""))
+
+    tag = ""
+    if tweet.get("is_reply"):
+        tag = " 💬"
+    elif tweet.get("is_retweet"):
+        tag = " 🔁"
+    elif tweet.get("is_quote"):
+        tag = " ↪️"
+
+    quote_block = ""
+    if tweet.get("is_quote") and tweet.get("quote_text"):
+        q_user = tweet.get("quote_user", "")
+        q_text = tweet.get("quote_text", "")[:200]
+        quote_block = f"\n\n> ↪️ **@{q_user}**: {q_text}"
+
+    tweet_text = tweet["text"][:400]
+    if len(tweet.get("text", "")) > 200:
+        tweet_text = f"> {tweet['text'][:150]}...\n>\n> (click Go to Post for full text)"
+
+    caption = (
+        f"## 🔔 New Post{tag}\n\n"
+        f"**{name}** ([@{uname}]({profile_url}))\n\n"
+        f"{tweet_text}{quote_block}\n\n"
+        f"---\n🕐 {post_time}"
+    )
+    buttons = [
+        {"text": "🔗 Go to Post", "url": tweet_url},
+        {"text": "🔕 Stop Notify", "callback_data": f"stop:{uname}"},
+    ]
+
+    photo_enabled = settings.get("photo_enabled", True)
+    video_enabled = settings.get("video_enabled", False)
+    gif_enabled = settings.get("gif_enabled", True)
+    if video_enabled and tweet.get("video_url"):
+        await tg_send(caption, video=tweet["video_url"], buttons=buttons)
+    elif gif_enabled and tweet.get("gif_url"):
+        await tg_send(caption, animation=tweet["gif_url"], buttons=buttons)
+    elif photo_enabled and tweet.get("photo_url"):
+        await tg_send(caption, photo=tweet["photo_url"], buttons=buttons)
+    else:
+        await tg_send(caption, buttons=buttons)
+    FORWARDED_COUNT += 1
+    log.info(f"Forwarded @{uname} {tid} (reply={tweet.get('is_reply')})")
+
 async def main():
     global FORWARDED_COUNT, AUTH_EXPIRED_SENT
     log.info("Starting x-tg-notify...")
     get_x_session()
     get_ct()
     log.info("X session ready")
+
+    # Refresh GraphQL query IDs from x.com (cached; scrapes if stale/missing).
+    load_query_ids()
+    scrape_query_ids()
+
     watchlist = load_watchlist()
+    # Backfill per-user post/reply filter flags on existing entries.
+    for _u, _i in watchlist.items():
+        ensure_filter_flags(_i)
+    save_watchlist(watchlist)
     log.info(f"Watchlist: {list(watchlist.keys())}")
     settings = load_settings()
     log.info(f"Settings: {settings}")
-    await tg_send("🤖 X Notify Bot started!\nUse /help for commands.")
 
     state = load_seen()
     seen_tweet_ids = state.get("seen_tweet_ids", {})
 
-    for uname, info in watchlist.items():
-        uid = info.get("id", "")
-        if uid:
-            wait = _rate.wait_time(f"seed:{uname}", 1)
-            if wait > 0: await asyncio.sleep(wait)
+    # id -> uname map for fast author matching in the List timeline.
+    id_to_uname: dict[str, str] = {}
+    def rebuild_id_map():
+        id_to_uname.clear()
+        for un, inf in watchlist.items():
+            uid = inf.get("id", "")
+            if uid:
+                id_to_uname[str(uid)] = un
+    rebuild_id_map()
+
+    # ── Migrate existing watchlist members into the X List ──────────
+    list_active = bool(LIST_ID)
+    if list_active:
+        log.info(f"List mode ON (list_id={LIST_ID}); migrating {len(watchlist)} members")
+        for uname, info in watchlist.items():
+            uid = info.get("id", "")
+            if uid:
+                ok = list_add_member(LIST_ID, uid)
+                if ok:
+                    log.info(f"List+ @{uname}")
+                await asyncio.sleep(0.5)
+    else:
+        log.warning("X_LIST_ID not set — falling back to per-user timeline polling (does not scale).")
+
+    # ── Seed seen_state so we don't flood old posts on startup ──────
+    if list_active:
+        tweets = fetch_list_timeline(LIST_ID, count=40, rl_key="list")
+        # Newest tweet id per author becomes the baseline.
+        for t in tweets:
+            au = id_to_uname.get(t.get("author_id", ""))
+            if not au:
+                continue
+            if t["id"] > seen_tweet_ids.get(au, "0"):
+                seen_tweet_ids[au] = t["id"]
+        # Any watched user with no tweets in the window gets a snowflake floor.
+        now_ms = int(time.time() * 1000)
+        floor = str((now_ms - 1288834974657) << 22)
+        for uname in watchlist:
+            seen_tweet_ids.setdefault(uname, floor)
+        log.info(f"Seeded {len(seen_tweet_ids)} users from list timeline")
+    else:
+        for uname, info in watchlist.items():
+            uid = info.get("id", "")
+            if not uid:
+                continue
             tweets = fetch_user_tweets(uid, 10, rl_key=f"tweets:{uname}")
-            if tweets:
-                for t in tweets:
-                    if not t.get("is_retweet"):
-                        seen_tweet_ids[uname] = t["id"]
-                        break
-                _rate.mark_ok(f"seed:{uname}")
-                log.info(f"Seeded @{uname}: {tweets[0]['id']}")
+            for t in tweets:
+                if not t.get("is_retweet"):
+                    seen_tweet_ids[uname] = t["id"]
+                    break
     save_seen({"seen_tweet_ids": seen_tweet_ids})
 
-    id_to_uname: dict[str, str] = {}
-    for uname, info in watchlist.items():
-        uid = info.get("id", "")
-        if uid:
-            id_to_uname[uid] = uname
+    await tg_set_commands()
+    await tg_send("🤖 X Notify Bot started!\nUse /help for commands.")
 
-    last_tweet_fetch: dict[str, float] = {}
-    last_update_id = 0
-    last_poll = 0
-    last_timeline_poll = 0
-
-    while True:
-        now = time.time()
-
-        try:
-            updates = await tg_get_updates(last_update_id + 1)
-            for u in updates:
-                last_update_id = u["update_id"]
-
-                cb = u.get("callback_query")
-                if cb:
-                    cb_data = cb.get("data", "")
-                    cb_id = cb.get("id", "")
-                    cb_chat = str(cb.get("message", {}).get("chat", {}).get("id", ""))
-                    if cb_data.startswith("stop:"):
-                        uname = cb_data.split(":", 1)[1]
-                        if uname in watchlist:
-                            uid = watchlist[uname]["id"]
-                            name = watchlist[uname]["name"]
-                            disable_notifs(uid); await asyncio.sleep(0.5)
-                            unfollow_user(uid)
-                            del watchlist[uname]; save_watchlist(watchlist)
-                            id_to_uname.pop(uid, None)
-                            await tg_answer_callback(cb_id, f"🔕 Stopped notifications for @{uname}")
-                            await tg_send(f"🔕 Stopped notifications for <b>{name}</b> (@{uname})\n• Unfollowed", cb_chat)
-                            log.info(f"Stop notify: @{uname}")
-                        else:
-                            await tg_answer_callback(cb_id, f"@{uname} not in watchlist", show_alert=True)
-                        continue
-                    elif cb_data.startswith("toggle_"):
-                        media_type = cb_data.split("_", 1)[1]
-                        key = f"{media_type}_enabled"
-                        if key in settings:
-                            settings[key] = not settings[key]
-                        else:
-                            settings[key] = True
-                        save_settings(settings)
-                        emoji = "📷" if media_type == "photo" else "🎬" if media_type == "video" else "🎞"
-                        state = "ON 🟢" if settings[key] else "OFF 🔴"
-                        await tg_answer_callback(cb_id, f"{emoji} {media_type.title()}: {state}")
-                        # Rebuild buttons
-                        photo_on = settings.get("photo_enabled", True)
-                        video_on = settings.get("video_enabled", False)
-                        gif_on = settings.get("gif_enabled", True)
-                        buttons = [
-                            [{"text": f"📷 Photo: {'ON 🟢' if photo_on else 'OFF 🔴'}", "callback_data": "toggle_photo"}],
-                            [{"text": f"🎬 Video: {'ON 🟢' if video_on else 'OFF 🔴'}", "callback_data": "toggle_video"}],
-                            [{"text": f"🎞 GIF: {'ON 🟢' if gif_on else 'OFF 🔴'}", "callback_data": "toggle_gif"}],
-                        ]
-                        keyboard = json.dumps({"inline_keyboard": buttons})
-                        c = await get_tg()
-                        await c.post(f"{TG_API}/editMessageText", json={
-                            "chat_id": cb_chat,
-                            "message_id": cb.get("message", {}).get("message_id"),
-                            "text": f"⚙️ <b>Settings</b>\n\n"
-                                    f"Posts always sent. Toggle media types:",
-                            "parse_mode": "HTML",
-                            "reply_markup": keyboard
-                        })
-                        continue
-
-                msg = u.get("message", {})
-                text = msg.get("text", "")
-                chat_id = str(msg.get("chat", {}).get("id", ""))
-                if text.startswith("/"):
-                    await handle_cmd(text, chat_id, watchlist, settings, seen_tweet_ids)
-                    id_to_uname = {}
-                    for un, info in watchlist.items():
-                        uid = info.get("id", "")
-                        if uid:
-                            id_to_uname[uid] = un
-
-        except Exception as e:
-            log.warning(f"TG update error: {e}")
-
-        if now - last_poll >= POLL_INTERVAL:
-            last_poll = now
-            wait = _rate.wait_time("notif", POLL_INTERVAL)
-            if wait > 0:
-                await asyncio.sleep(wait)
-
+    # ── Task 1: Telegram command loop (own long-poll, never blocks X) ─
+    async def tg_command_loop():
+        nonlocal watchlist, settings, seen_tweet_ids
+        last_update_id = 0
+        while True:
             try:
-                notifs = fetch_notifications()
-                if not notifs and not AUTH_EXPIRED_SENT:
-                    # Check if it's an auth issue (empty after rate limit handled)
-                    pass  # auth detection happens in fetch_notifications now
-                for n in notifs:
-                    icon, msg_text = n["icon"], n["message"]
-                    if "login" in msg_text.lower() or "temporary label" in msg_text.lower():
+                updates = await tg_get_updates(last_update_id + 1, timeout=25)
+                for u in updates:
+                    last_update_id = u["update_id"]
+                    cb = u.get("callback_query")
+                    if cb:
+                        await handle_callback(cb, watchlist, settings, seen_tweet_ids, rebuild_id_map, list_active)
                         continue
-                    if icon != "bell_icon":
-                        continue
-
-                    notif_uid = n.get("user_id", "")
-                    matched = id_to_uname.get(notif_uid) if notif_uid else None
-                    if not matched:
-                        for uname, info in watchlist.items():
-                            if uname.lower() in msg_text.lower() or info["name"][:8].lower() in msg_text.lower():
-                                matched = uname; break
-                    if not matched:
-                        continue
-
-                    uid = watchlist[matched].get("id", "")
-                    if not uid:
-                        continue
-
-                    now_ts = time.time()
-                    if now_ts - last_tweet_fetch.get(matched, 0) < 30:
-                        continue
-                    last_tweet_fetch[matched] = now_ts
-
-                    tw_wait = _rate.wait_time(f"tweets:{matched}", 5)
-                    if tw_wait > 0:
-                        await asyncio.sleep(tw_wait)
-
-                    tweets = fetch_user_tweets(uid, 10, rl_key=f"tweets:{matched}")
-                    if not tweets:
-                        continue
-
-                    last_seen = seen_tweet_ids.get(matched, "0")
-                    best = None
-                    for t in tweets:
-                        if t.get("is_retweet"): continue
-                        if t["id"] > last_seen:
-                            if best is None or t["id"] > best["id"]:
-                                best = t
-
-                    if best:
-                        seen_tweet_ids[matched] = best["id"]
-                        save_seen({"seen_tweet_ids": seen_tweet_ids})
-                        FORWARDED_COUNT += 1
-                        name = watchlist[matched]["name"]
-                        tweet_url = f"https://x.com/{matched}/status/{best['id']}"
-                        profile_url = f"https://x.com/{matched}"
-                        post_time = format_tweet_time(best.get("created", ""))
-
-                        quote_block = ""
-                        if best.get("is_quote") and best.get("quote_text"):
-                            q_user = best.get("quote_user", "")
-                            q_text = best.get("quote_text", "")[:200]
-                            quote_block = f"\n\n> ↪️ **@{q_user}**: {q_text}"
-                        tweet_text = best["text"][:400]
-                        # Wrap long tweets in collapsible block
-                        if len(best.get("text", "")) > 200:
-                            tweet_text = f"> {best['text'][:150]}...\n>\n> (click Go to Post for full text)"
-                        caption = (
-                            f"## 🔔 New Post\n\n"
-                            f"**{name}** ([@{matched}]({profile_url}))\n\n"
-                            f"{tweet_text}{quote_block}\n\n"
-                            f"---\n🕐 {post_time}"
-                        )
-
-                        buttons = [
-                            {"text": "🔗 Go to Post", "url": tweet_url},
-                            {"text": "🔕 Stop Notify", "callback_data": f"stop:{matched}"},
-                        ]
-                        # Send with appropriate media type
-                        photo_enabled = settings.get("photo_enabled", True)
-                        video_enabled = settings.get("video_enabled", False)
-                        gif_enabled = settings.get("gif_enabled", True)
-                        media_url = None
-                        media_type = None
-                        if video_enabled and best.get("video_url"):
-                            media_url = best["video_url"]
-                            media_type = "video"
-                        elif gif_enabled and best.get("gif_url"):
-                            media_url = best["gif_url"]
-                            media_type = "gif"
-                        elif photo_enabled and best.get("photo_url"):
-                            media_url = best["photo_url"]
-                            media_type = "photo"
-                        # Always send text, attach media if enabled
-                        if media_type == "video":
-                            await tg_send(caption, video=media_url, buttons=buttons)
-                        elif media_type == "gif":
-                            await tg_send(caption, animation=media_url, buttons=buttons)
-                        elif media_type == "photo":
-                            await tg_send(caption, photo=media_url, buttons=buttons)
-                        else:
-                            await tg_send(caption, buttons=buttons)
-                        _rate.mark_ok(f"tweets:{matched}")
-                        log.info(f"Forwarded @{matched} {best['id']}")
-
+                    msg = u.get("message", {})
+                    text = msg.get("text", "")
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    if text.startswith("/"):
+                        await handle_cmd(text, chat_id, watchlist, settings, seen_tweet_ids,
+                                         list_active=list_active)
+                        rebuild_id_map()
             except Exception as e:
-                log.warning(f"Poll error: {e}")
+                log.warning(f"TG loop error: {e}")
+                await asyncio.sleep(2)
 
-        # Timeline fallback — catches tweets missed by notification gap
-        if now - last_timeline_poll >= TIMELINE_INTERVAL:
-            last_timeline_poll = now
-            for uname, info in list(watchlist.items()):
-                uid = info.get("id", "")
-                if not uid: continue
-                tw_wait = _rate.wait_time(f"tweets:{uname}", 10)
-                if tw_wait > 0: await asyncio.sleep(tw_wait)
-                try:
-                    tweets = fetch_user_tweets(uid, 10, rl_key=f"tweets:{uname}")
-                    if not tweets: continue
-                    last_seen = seen_tweet_ids.get(uname, "0")
-                    new_tweets = []
+    # ── Task 2: X poll loop (List timeline primary; per-user fallback) ─
+    async def x_poll_loop():
+        nonlocal seen_tweet_ids
+        last_notif_poll = 0.0
+        while True:
+            now = time.time()
+            try:
+                if list_active:
+                    wait = _rate.wait_time("list", LIST_POLL_INTERVAL)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    tweets = fetch_list_timeline(LIST_ID, count=40, rl_key="list")
+                    # Oldest-first so multiple new tweets forward in order.
+                    new = []
                     for t in tweets:
-                        if t.get("is_retweet"): continue
-                        if t["id"] > last_seen:
-                            new_tweets.append(t)
-                    for best in new_tweets:
-                        # Skip if notification loop already forwarded this tweet
-                        if best["id"] <= seen_tweet_ids.get(uname, "0"):
+                        au = id_to_uname.get(t.get("author_id", ""))
+                        if not au or au not in watchlist:
                             continue
-                        # Update seen IMMEDIATELY to prevent notification loop from re-forwarding
-                        seen_tweet_ids[uname] = best["id"]
-                        tid = best["id"]
-                        tweet_url = f"https://x.com/{uname}/status/{tid}"
-                        profile_url = f"https://x.com/{uname}"
-                        post_time = format_tweet_time(best.get("created", ""))
-                        tweet_text = best["text"][:400]
-                        if len(best.get("text", "")) > 200:
-                            tweet_text = f"> {best['text'][:150]}...\n>\n> (click Go to Post for full text)"
-                        caption = (
-                            f"## 🔔 New Post\n\n"
-                            f"**{info['name']}** ([@{uname}]({profile_url}))\n\n"
-                            f"{tweet_text}\n\n"
-                            f"---\n🕐 {post_time}"
-                        )
-                        buttons = [
-                            {"text": "🔗 Go to Post", "url": tweet_url},
-                            {"text": "🔕 Stop Notify", "callback_data": f"stop:{uname}"},
-                        ]
-                        photo_enabled = settings.get("photo_enabled", True)
-                        video_enabled = settings.get("video_enabled", False)
-                        gif_enabled = settings.get("gif_enabled", True)
-                        media_url = None
-                        media_type = None
-                        if video_enabled and best.get("video_url"):
-                            media_url = best["video_url"]
-                            media_type = "video"
-                        elif gif_enabled and best.get("gif_url"):
-                            media_url = best["gif_url"]
-                            media_type = "gif"
-                        elif photo_enabled and best.get("photo_url"):
-                            media_url = best["photo_url"]
-                            media_type = "photo"
-                        if media_type == "video":
-                            await tg_send(caption, video=media_url, buttons=buttons)
-                        elif media_type == "gif":
-                            await tg_send(caption, animation=media_url, buttons=buttons)
-                        elif media_type == "photo":
-                            await tg_send(caption, photo=media_url, buttons=buttons)
-                        else:
-                            await tg_send(caption, buttons=buttons)
-                        FORWARDED_COUNT += 1
-                        log.info(f"Timeline poll forwarded @{uname} {tid}")
-                    # seen_tweet_ids already updated per-tweet above
-                except Exception as e:
-                    log.warning(f"Timeline poll error @{uname}: {e}")
-            save_seen({"seen_tweet_ids": seen_tweet_ids})
+                        if t["id"] <= seen_tweet_ids.get(au, "0"):
+                            continue
+                        new.append((au, t))
+                    new.sort(key=lambda x: x[1]["id"])
+                    dirty = False
+                    for au, t in new:
+                        # advance seen regardless (so filtered-out tweets aren't re-checked)
+                        if t["id"] > seen_tweet_ids.get(au, "0"):
+                            seen_tweet_ids[au] = t["id"]
+                            dirty = True
+                        if not passes_filter(t, watchlist[au]):
+                            log.info(f"Filtered @{au} {t['id']} (reply={t.get('is_reply')})")
+                            continue
+                        await forward_tweet(t, au, watchlist[au], settings)
+                    if dirty:
+                        save_seen({"seen_tweet_ids": seen_tweet_ids})
+                else:
+                    # Fallback: per-user timeline polling (no List configured).
+                    for uname, info in list(watchlist.items()):
+                        uid = info.get("id", "")
+                        if not uid:
+                            continue
+                        tw_wait = _rate.wait_time(f"tweets:{uname}", 10)
+                        if tw_wait > 0:
+                            await asyncio.sleep(tw_wait)
+                        tweets = fetch_user_tweets(uid, 10, rl_key=f"tweets:{uname}")
+                        new = [t for t in tweets if t["id"] > seen_tweet_ids.get(uname, "0")]
+                        new.sort(key=lambda t: t["id"])
+                        for t in new:
+                            if t["id"] > seen_tweet_ids.get(uname, "0"):
+                                seen_tweet_ids[uname] = t["id"]
+                            if not passes_filter(t, info):
+                                continue
+                            await forward_tweet(t, uname, info, settings)
+                        save_seen({"seen_tweet_ids": seen_tweet_ids})
+            except Exception as e:
+                log.warning(f"X poll error: {e}")
+            await asyncio.sleep(LIST_POLL_INTERVAL if list_active else 1)
 
-        await asyncio.sleep(0.5)
+    await asyncio.gather(tg_command_loop(), x_poll_loop())
 
 # ── Entry Point ─────────────────────────────────────────────────────
 def entry():
