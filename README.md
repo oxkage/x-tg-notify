@@ -2,14 +2,14 @@
 
 # x-tg-notify
 
-**Real-time X (Twitter) notification forwarder to Telegram**
+**Real-time X (Twitter) → Telegram notification forwarder**
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776ab?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-44cc11?style=flat-square)](LICENSE)
 
-Monitor X accounts and receive instant Telegram alerts when they post — with photos, videos, clickable links, and inline action buttons.
+Monitor X accounts and receive instant Telegram alerts when they post — with photos, videos, clickable links, and inline action buttons. Built on a single X List poll that scales flat to 400+ accounts.
 
-[Features](#features) · [Quick Start](#quick-start) · [Commands](#commands) · [Configuration](#configuration) · [Debug CLI](#debug-cli)
+[Features](#features) · [Quick Start](#quick-start) · [Commands](#commands) · [Configuration](#configuration) · [Architecture](#architecture)
 
 </div>
 
@@ -17,17 +17,19 @@ Monitor X accounts and receive instant Telegram alerts when they post — with p
 
 ## Features
 
-- **Real-time forwarding** — polls X notifications every 5 seconds, forwards new posts instantly
+- **Scales to 400+ accounts** — a single `ListLatestTweetsTimeline` poll returns new tweets across every watched account at a flat ~20 requests/min, instead of polling each user separately
+- **Two decoupled async loops** — X polling and Telegram commands run under `asyncio.gather`, so neither blocks the other (no command lag, no missed tweets)
+- **Per-user filters** — toggle **posts** and **replies** independently per account (`/filter`, or inline buttons on `/add`). Default: posts ON, replies OFF. Self-threads count as posts
 - **Rich messages** — structured formatting with headings, dividers, and embedded media
 - **Photo + Video + GIF** — media types individually toggleable via `/settings`
-- **Inline buttons** — "Go to Post" links directly to the tweet, "Stop Notify" removes the account
-- **Auto-follow** — `/add` automatically follows the user and enables post notifications
-- **Deduplication** — tweet ID tracking persists across restarts, never forwards the same tweet twice
-- **Anti-detection** — Chrome TLS fingerprint impersonation + per-request transaction headers
-- **Setup wizard** — interactive first-run guides you through credentials, creates venv, validates connections
-- **Rate limit aware** — exponential backoff on 429s, stays within X API limits
-- **Single instance lock** — PID file prevents multiple bot instances running simultaneously
-- **Timeline fallback** — catches tweets missed by notification polling (every 60 seconds)
+- **Inline buttons** — "Go to Post" links to the tweet; "Stop Notify" removes the account; filter toggles
+- **Command menu** — native Telegram `/` command menu via `setMyCommands`
+- **Self-healing query IDs** — GraphQL query IDs are scraped from `main.js`, cached, and auto-refreshed on a 404
+- **No old-post flood** — `/add` and startup seed a snowflake baseline so only genuinely new tweets are forwarded
+- **Deduplication** — tweet ID tracking persists across restarts; never forwards the same tweet twice
+- **Anti-detection** — Chrome TLS fingerprint impersonation (`curl_cffi`) + per-request ClientTransaction headers
+- **Setup wizard** — interactive first-run: credentials, venv, connection validation
+- **Single instance lock** — PID file prevents concurrent bot instances
 
 ---
 
@@ -45,16 +47,27 @@ On first run, the **setup wizard** launches automatically:
 
 1. Checks Python 3.10+
 2. Creates virtual environment and installs dependencies
-3. Walks you through getting each credential (step-by-step with instructions)
+3. Walks you through each credential (step-by-step)
 4. Validates Telegram connection (sends test message)
 5. Verifies X credential format
 6. Saves everything to `.env`
 
-### 2. Add accounts
+### 2. Create an X List
 
-Send `/add @username` to your Telegram bot — it follows them and enables notifications.
+The bot polls a single private X List for efficiency. Create one on X (it can be private), then add its ID to `.env`:
 
-### 3. Done
+```bash
+X_LIST_ID=1234567890123456789
+```
+
+> [!TIP]
+> The List ID is the number in the List URL: `x.com/i/lists/<X_LIST_ID>`. The bot auto-adds watched accounts to this List on `/add` and migrates your existing watchlist into it on startup.
+
+### 3. Add accounts
+
+Send `/add @username` to your Telegram bot — it follows them, adds them to the List, and shows post/reply filter toggles.
+
+### 4. Done
 
 New posts arrive in your Telegram chat with photos, timestamps, and inline buttons.
 
@@ -67,9 +80,10 @@ New posts arrive in your Telegram chat with photos, timestamps, and inline butto
 
 | Command | Description |
 |---------|-------------|
-| `/add @username` | Follow user + enable post notifications |
-| `/remove @username` | Disable notifications + unfollow |
-| `/list` | Show all watched users |
+| `/add @username` | Follow user + add to List + show filter toggles |
+| `/remove @username` | Unfollow + remove from List |
+| `/filter @username` | Toggle posts / replies for a user |
+| `/list` | Show all watched users with their filter states |
 | `/status` | Bot status + stats |
 | `/settings` | Toggle media types (photo/video/gif) |
 | `/help` | Show help message |
@@ -80,10 +94,9 @@ New posts arrive in your Telegram chat with photos, timestamps, and inline butto
 You:    /add elonmusk
 Bot:    ⏳ Resolving @elonmusk...
 Bot:    ✅ Added Elon Musk
-        👤 @elonmusk
-        • Followed ✅
-        • Notifications 🔔
-        [👤 View Profile]  [🔕 Stop Notify]
+        👤 @elonmusk  ·  List ✅
+        📝 Posts: ON     💬 Replies: OFF
+        [📝 Posts]  [💬 Replies]  [🔕 Stop]
 ```
 
 **Example — forwarded post:**
@@ -137,13 +150,32 @@ The setup wizard handles this interactively. For reference:
 3. Find `"chat":{"id":XXXXX}` — that number is your Chat ID
 </details>
 
+<details>
+<summary><b>X List ID</b></summary>
+
+1. Create a List on X (private is fine)
+2. Open it — the URL is `x.com/i/lists/<LIST_ID>`
+3. Copy the numeric `LIST_ID` into `.env` as `X_LIST_ID`
+</details>
+
 ---
 
 ## Configuration
 
-### Media Settings
+### Per-user filters
 
-Toggle individual media types via `/settings` in Telegram:
+Each watched account carries its own `{posts, replies}` flags:
+
+| Flag | Default | Forwards |
+|------|---------|----------|
+| `posts` | ON | Original tweets + self-threads + retweets |
+| `replies` | OFF | Replies to **other** accounts |
+
+Toggle them with `/filter @user` or the inline buttons shown on `/add`.
+
+### Media settings
+
+Toggle individual media types via `/settings`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -151,68 +183,15 @@ Toggle individual media types via `/settings` in Telegram:
 | `video_enabled` | OFF | Send tweet videos |
 | `gif_enabled` | ON | Send tweet GIFs |
 
-Posts are always forwarded — toggles only control media attachment.
+Posts are always forwarded — media toggles only control attachments.
 
-### Polling interval
-
-Default: **5 seconds**. Change in `bot.py`:
+### Polling intervals
 
 ```python
-POLL_INTERVAL = 5  # seconds
+LIST_POLL_INTERVAL = 3   # seconds — primary List timeline poll
 ```
 
-### Rate limits
-
-X's `NotificationsTimeline` endpoint allows ~1500 requests per 16 minutes.
-
-| Interval | Requests / 16min | % of Limit |
-|----------|-----------------|------------|
-| 5s | 192 | 13% |
-| 10s | 96 | 6% |
-| 30s | 32 | 2% |
-
-5s polling uses ~13% of the rate limit — safe for continuous operation.
-
----
-
-## Debug CLI
-
-Test individual components without running the full bot:
-
-```bash
-source venv/bin/activate
-
-# Fetch a tweet by ID
-python3 debug.py tweet <tweet_id>
-
-# Send a tweet to Telegram (full pipeline)
-python3 debug.py send <tweet_id>
-
-# Send text only (no media)
-python3 debug.py send-text <tweet_id>
-
-# Test Telegram connection
-python3 debug.py test-tg
-
-# Test video/photo sending
-python3 debug.py test-video <url>
-python3 debug.py test-photo <url>
-
-# Show current notifications
-python3 debug.py notifs
-
-# Fetch user timeline
-python3 debug.py timeline <username>
-
-# Show state (seen tweets, watchlist, settings)
-python3 debug.py state
-
-# Clear seen state
-python3 debug.py reset
-
-# Show raw API response
-python3 debug.py raw <tweet_id>
-```
+The List poll is flat-cost: one request returns new tweets across **all** members regardless of how many accounts you watch, so 3s polling stays well within X's rate limits even at 400+ accounts.
 
 ---
 
@@ -220,11 +199,11 @@ python3 debug.py raw <tweet_id>
 
 ![Architecture Diagram](architecture.png)
 
-1. Bot polls `NotificationsTimeline` GraphQL endpoint every 5 seconds
-2. On `bell_icon` notification (new post), fetches latest tweets via `UserTweets`
-3. Compares tweet ID against stored last-seen ID (snowflake: greater = newer)
-4. Forwards to Telegram with rich formatting, embedded media, and inline buttons
-5. Timeline fallback (every 60s) catches tweets missed by notification polling
+1. **X Poll Loop** polls `ListLatestTweetsTimeline` every 3s — one request returns the newest tweets across every List member, time-sorted
+2. Each tweet is matched to a watched account by `author_id`, then its per-user `{posts, replies}` filter is applied
+3. New tweets (snowflake ID greater than last-seen) are forwarded to Telegram with rich formatting, embedded media, and inline buttons
+4. **TG Command Loop** runs independently (`asyncio.gather`) on a long-poll, handling `/add`, `/remove`, `/filter`, callbacks, and List membership changes
+5. GraphQL query IDs self-heal: scraped from `main.js`, cached in `query_ids.json`, re-scraped automatically on a 404
 
 ---
 
@@ -232,15 +211,16 @@ python3 debug.py raw <tweet_id>
 
 ```
 x-tg-notify/
-├── bot.py              # Setup wizard + bot runtime
+├── bot.py              # Setup wizard + bot runtime (two async loops)
 ├── debug.py            # Debug CLI for testing
 ├── requirements.txt    # Python dependencies
 ├── .env.example        # Credential template
 ├── .env                # Your credentials (git-ignored)
-├── settings.json       # Media toggle settings (git-ignored)
+├── watchlist.json      # Watched users + filters (git-ignored)
+├── seen_state.json     # Dedup state (git-ignored)
+├── settings.json       # Media toggles (git-ignored)
+├── query_ids.json      # GraphQL query-ID cache (git-ignored)
 ├── venv/               # Virtual environment (auto-created)
-├── watchlist.json      # Watched users (auto-created)
-├── seen_state.json     # Dedup state (auto-created)
 └── .bot.pid            # Single instance lock (auto-created)
 ```
 
@@ -256,16 +236,13 @@ rm .bot.pid
 python3 bot.py
 ```
 
-**Unauthorized on notifications** — Your `auth_token` expired. Re-copy fresh cookies from your browser.
+**Unauthorized / auth failed** — Your `auth_token` expired. Re-copy fresh cookies from your browser.
 
-**Not forwarding new posts** — Check `/list` to verify the user is watched, and ensure the bot is running.
+**Not forwarding new posts** — Check `/list` to verify the user is watched and the filter (posts/replies) is enabled. Confirm `X_LIST_ID` is set and the account is in the List.
 
-**Forwards old tweets on restart** — This shouldn't happen (`seen_state.json` persists). If it does:
+**404 on List timeline** — A GraphQL query ID went stale; the bot re-scrapes automatically. If it persists, restart to force a fresh scrape.
 
-```bash
-rm seen_state.json
-python3 bot.py  # Re-seeds on first run
-```
+**Forwards old tweets on add** — Shouldn't happen (`/add` seeds a baseline). If it does, the account had no recent tweets to seed from; it self-corrects after the first new post.
 
 ---
 
